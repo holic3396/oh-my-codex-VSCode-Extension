@@ -4,8 +4,8 @@
  */
 
 import { execFileSync, spawn } from "child_process";
-import { basename, dirname, join, posix, win32 } from "path";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { basename, dirname, join, posix, resolve, win32 } from "path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "fs";
 import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash } from "crypto";
@@ -67,6 +67,7 @@ import {
   getBaseStateDir,
   getStateDir,
   listModeStateFilesWithScopePreference,
+  type ModeStateFileRef,
 } from "../mcp/state-paths.js";
 import { evaluateRalphCompletionAuditEvidence, isRalphCompletePhase } from "../ralph/completion-audit.js";
 import {
@@ -2347,7 +2348,27 @@ async function showStatus(): Promise<void> {
   const { readFile } = await import("fs/promises");
   const cwd = process.cwd();
   try {
-    const refs = await listModeStateFilesWithScopePreference(cwd);
+    let refs = await listModeStateFilesWithScopePreference(cwd);
+    // Reconcile with hook-visible run-dir state when the worktree-scoped state
+    // list reports no active workflow mode (parity with `omx cancel`). This
+    // surfaces detached/madmax sessions whose state lives under the run dir.
+    const hasActiveWorkflowMode = async (candidate: ModeStateFileRef[]): Promise<boolean> => {
+      for (const ref of candidate) {
+        const mode = basename(ref.path).replace("-state.json", "");
+        if (mode === SKILL_ACTIVE_STATE_MODE) continue;
+        try {
+          const parsed = JSON.parse(await readFile(ref.path, "utf-8")) as Record<string, unknown>;
+          if (parsed.active === true) return true;
+        } catch {
+          continue;
+        }
+      }
+      return false;
+    };
+    if (!(await hasActiveWorkflowMode(refs))) {
+      const runDirRefs = await listHookVisibleRunDirStateRefs(cwd);
+      if (await hasActiveWorkflowMode(runDirRefs)) refs = runDirRefs;
+    }
     const states = refs.map((ref) => ref.path);
     const ultragoalState = await readUltragoalState(cwd).catch(() => null);
     if (states.length === 0) {
@@ -5826,13 +5847,117 @@ async function flushHookDerivedWatcherOnce(cwd: string): Promise<void> {
   });
 }
 
+// Canonicalize a path for comparing a registry `source_cwd` against the current
+// working directory. `process.cwd()` resolves symlinks (e.g. macOS `/var` ->
+// `/private/var`), so registry values must be canonicalized the same way or the
+// run-dir fallback never matches. Falls back to `resolve` when the path is
+// missing (realpathSync requires an existing target).
+function canonicalizePathForRunDirMatch(p: string): string {
+  try {
+    return realpathSync(resolve(p));
+  } catch {
+    return resolve(p);
+  }
+}
+
+async function listHookVisibleRunDirStateRefs(cwd: string): Promise<ModeStateFileRef[]> {
+  const runsRoot = resolveMadmaxRunsRoot(process.env);
+  const registryPath = join(runsRoot, "registry.jsonl");
+  const runDirs = new Set<string>();
+  const canonicalCwd = canonicalizePathForRunDirMatch(cwd);
+  const canonicalRunsRoot = resolve(runsRoot);
+
+  const addRecord = (raw: unknown): void => {
+    if (!raw || typeof raw !== "object") return;
+    const record = raw as Record<string, unknown>;
+    const sourceCwd = typeof record.source_cwd === "string" ? record.source_cwd.trim() : "";
+    const runDir = typeof record.run_dir === "string"
+      ? record.run_dir.trim()
+      : typeof record.cwd === "string"
+        ? record.cwd.trim()
+        : "";
+    if (!sourceCwd || !runDir) return;
+
+    try {
+      if (canonicalizePathForRunDirMatch(sourceCwd) !== canonicalCwd) return;
+      const resolvedRunDir = resolve(runDir);
+      if (
+        resolvedRunDir !== canonicalRunsRoot
+        && !resolvedRunDir.startsWith(`${canonicalRunsRoot}/`)
+      ) {
+        return;
+      }
+      runDirs.add(resolvedRunDir);
+    } catch {
+      return;
+    }
+  };
+
+  try {
+    const rawRegistry = await readFile(registryPath, "utf-8");
+    for (const line of rawRegistry.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        addRecord(JSON.parse(trimmed));
+      } catch {
+        continue;
+      }
+    }
+  } catch {}
+
+  try {
+    const activeDir = join(runsRoot, MADMAX_DETACHED_ACTIVE_DIR);
+    const files = await readdir(activeDir).catch(() => [] as string[]);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        addRecord(JSON.parse(await readFile(join(activeDir, file), "utf-8")));
+      } catch {
+        continue;
+      }
+    }
+  } catch {}
+
+  const refs: ModeStateFileRef[] = [];
+  const seenPaths = new Set<string>();
+  for (const runDir of runDirs) {
+    const stateDir = join(runDir, ".omx", "state");
+    let sessionId: string | undefined;
+    try {
+      const session = JSON.parse(await readFile(join(stateDir, "session.json"), "utf-8")) as Record<string, unknown>;
+      if (typeof session.session_id === "string" && session.session_id.trim()) {
+        sessionId = session.session_id.trim();
+      }
+    } catch {}
+
+    const candidateDirs = sessionId ? [join(stateDir, "sessions", sessionId), stateDir] : [stateDir];
+    for (const dir of candidateDirs) {
+      const files = await readdir(dir).catch(() => [] as string[]);
+      for (const file of files) {
+        if (!file.endsWith("-state.json") || file === "session.json") continue;
+        const path = join(dir, file);
+        if (seenPaths.has(path)) continue;
+        seenPaths.add(path);
+        refs.push({
+          mode: file.slice(0, -"-state.json".length),
+          path,
+          scope: dir === stateDir ? "root" : "session",
+        });
+      }
+    }
+  }
+
+  return refs.sort((a, b) => a.mode.localeCompare(b.mode));
+}
+
 async function cancelModes(): Promise<void> {
   const { writeFile, readFile } = await import("fs/promises");
   const cwd = process.cwd();
   const nowIso = new Date().toISOString();
   try {
-    const refs = await listModeStateFilesWithScopePreference(cwd);
-    const states = new Map<
+    const loadStates = async (refs: ModeStateFileRef[]) => {
+      const loaded = new Map<
       string,
       {
         path: string;
@@ -5841,20 +5966,32 @@ async function cancelModes(): Promise<void> {
       }
     >();
 
-    for (const ref of refs) {
-      const content = await readFile(ref.path, "utf-8");
-      let parsedState: Record<string, unknown>;
-      try {
-        parsedState = JSON.parse(content) as Record<string, unknown>;
-      } catch (err) {
-        logCliOperationFailure(err);
-        continue;
+      for (const ref of refs) {
+        const content = await readFile(ref.path, "utf-8");
+        let parsedState: Record<string, unknown>;
+        try {
+          parsedState = JSON.parse(content) as Record<string, unknown>;
+        } catch (err) {
+          logCliOperationFailure(err);
+          continue;
+        }
+        loaded.set(ref.mode, {
+          path: ref.path,
+          scope: ref.scope,
+          state: parsedState,
+        });
       }
-      states.set(ref.mode, {
-        path: ref.path,
-        scope: ref.scope,
-        state: parsedState,
-      });
+      return loaded;
+    };
+
+    let states = await loadStates(await listModeStateFilesWithScopePreference(cwd));
+    const hasActiveWorkflowMode = (entries: typeof states): boolean =>
+      [...entries.entries()].some(
+        ([mode, entry]) => mode !== SKILL_ACTIVE_STATE_MODE && entry.state.active === true,
+      );
+    if (!hasActiveWorkflowMode(states)) {
+      const runDirStates = await loadStates(await listHookVisibleRunDirStateRefs(cwd));
+      if (hasActiveWorkflowMode(runDirStates)) states = runDirStates;
     }
 
     const changed = new Set<string>();
@@ -5878,8 +6015,19 @@ async function cancelModes(): Promise<void> {
       entry.state.current_phase = phase;
       entry.state.completed_at = nowIso;
       entry.state.last_turn_at = nowIso;
+      if (mode === SKILL_ACTIVE_STATE_MODE) {
+        entry.state.phase = phase;
+        const activeSkills = Array.isArray(entry.state.active_skills)
+          ? entry.state.active_skills
+          : [];
+        entry.state.active_skills = activeSkills.map((skill) => (
+          skill && typeof skill === "object"
+            ? { ...(skill as Record<string, unknown>), active: false, phase }
+            : skill
+        ));
+      }
       changed.add(mode);
-      if (reportIfWasActive && wasActive) reported.add(mode);
+      if (reportIfWasActive && wasActive && mode !== SKILL_ACTIVE_STATE_MODE) reported.add(mode);
     };
 
     const ralphLinksUltrawork = (state: Record<string, unknown>): boolean =>
