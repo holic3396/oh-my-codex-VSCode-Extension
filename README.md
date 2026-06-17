@@ -277,6 +277,33 @@ Inside an Ultragoal story, use `$team` only when that story benefits from coordi
 | `$team "..."` | coordinated parallel execution when the work is big enough |
 | `/skills` | browsing installed skills and supporting helpers |
 
+## VSCode extension UX
+
+This fork includes an early desktop VSCode extension package at
+`packages/vscode-extension`. It keeps Codex CLI as the execution engine, but
+uses VSCode UI surfaces to reduce command memorization for the common path:
+
+- Chat-first default view with current-work summary and milestone timeline
+- Control Center webview for sessions, teams, workers, tasks, tmux panes, and the form-based OMX launcher
+- Log Explorer webview for structured search across `.omx/logs`, VSCode logs, session history, and team events
+- Activity Bar tree view for active session, teams, and recent VSCode launch logs
+- Status Bar summary rendered from the existing OMX HUD state reader
+- Output Channel log streaming from direct OMX child processes with linked background logs
+
+The default Chat composer launches OMX through the non-interactive `omx exec`
+surface and writes session logs to `.omx/logs/vscode/<session-id>.log`.
+Control Center can also mirror bounded tmux pane tails and send confirmed input
+to the leader pane. Risky launcher commands show a preview before execution.
+
+Development:
+
+```bash
+npm run build
+cd packages/vscode-extension
+npm install
+npm run compile
+```
+
 ## Advanced / operator surfaces
 
 These are useful, but they are not the main onboarding path.

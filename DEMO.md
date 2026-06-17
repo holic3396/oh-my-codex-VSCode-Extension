@@ -1,5 +1,75 @@
 # oh-my-codex Demo Guide
 
+## Primary Demo: VS Code Extension
+
+The preferred onboarding path is now the VS Code extension. Users should not need to memorize `omx` subcommands for common work.
+
+### 1. Open the Chat-first OMX view
+
+1. Open this repository in desktop VS Code.
+2. Open the **OMX** Activity Bar.
+3. Use **Chat** as the default screen.
+
+What the user sees:
+
+- A persistent chat composer for normal task prompts.
+- A compact current-work summary.
+- A milestone timeline for active work.
+- Intent-based actions: start work, resume, team run, doctor, stop, logs.
+
+### 2. Start work from Chat
+
+Type a normal request instead of a CLI command:
+
+```text
+Fix the failing TypeScript build and show the verification result.
+```
+
+Expected:
+
+- The extension launches the default `omx exec` path.
+- Long stdout/stderr output is collapsed into a concise action card.
+- The related background log is linked from the message.
+- The milestone timeline updates from `.omx/state`, session history, and event logs.
+
+### 3. Open OMX Control Center
+
+Click **Control Center** from Chat or run **OMX: Open Control Center**.
+
+Expected:
+
+- Workspace status, teams, workers, tasks, and tmux panes appear in one operational dashboard.
+- Selecting a tmux pane shows a bounded tail snapshot.
+- Sending input is allowed to the leader pane by default; worker pane input asks for confirmation.
+- The OMX Launcher exposes common workflows through forms instead of requiring command memorization.
+- Risky commands show the generated `omx ...` command and ask for confirmation before running.
+
+### 4. Search Logs
+
+Click **Logs** from Chat or run **OMX: Open Log Explorer**.
+
+Expected:
+
+- Logs from `.omx/logs`, `.omx/logs/vscode`, session history, and team events are indexed on demand.
+- Search filters include source, team, worker, task, session, and text query.
+- Each result shows a readable preview and an **Open Log** action that jumps to the source file.
+
+### 5. Use CLI only as an escape hatch
+
+The CLI remains the execution engine and advanced escape hatch. The extension should be the default product surface for:
+
+- Chat-based task execution.
+- Progress summary.
+- Control Center monitoring.
+- Log search and background output inspection.
+- Common OMX commands through the form-based launcher.
+
+---
+
+## CLI Appendix
+
+The remaining sections document the lower-level CLI workflow for operators and regression testing.
+
 ## Prerequisites
 
 - Node.js >= 20
