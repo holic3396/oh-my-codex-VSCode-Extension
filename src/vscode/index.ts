@@ -7,7 +7,11 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { redactAuthSecrets } from '../auth/redact.js';
 import { CODEX_BYPASS_FLAG, MADMAX_FLAG, MADMAX_SPARK_FLAG } from '../cli/constants.js';
-import { resolveCommandPathForPlatform } from '../utils/platform-command.js';
+import {
+  resolveCommandPathForPlatform,
+  spawnPlatformCommand,
+  spawnPlatformCommandSync,
+} from '../utils/platform-command.js';
 
 export const DIRECT_SESSION_SCHEMA_VERSION = 'omx.vscode/direct-session/v1';
 
@@ -36,6 +40,7 @@ export interface LaunchDirectSessionOptions extends BuildDirectSessionArgsOption
   prompt?: string;
   omxCommand?: string;
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
   dangerousApproved?: boolean;
   logPath?: string;
   sessionId?: string;
@@ -74,6 +79,7 @@ export interface RunOmxCatalogCommandOptions {
   omxCommand?: string;
   args: string[];
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
   timeoutMs?: number;
 }
 
@@ -90,6 +96,10 @@ interface LaunchDirectSessionDeps {
   spawn?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
   now?: () => Date;
   randomId?: () => string;
+}
+
+interface RunOmxCatalogCommandDeps {
+  spawnSync?: typeof nodeSpawnSync;
 }
 
 function normalizeCwd(cwd: string): string {
@@ -243,14 +253,16 @@ export function launchDirectSession(
   const logPath = options.logPath ? resolve(options.logPath) : defaultLogPath(cwd, sessionId);
   const logStream = ensureLogStream(logPath);
   const env = resolveLaunchEnv(options.env ?? process.env, sessionId, logPath);
+  const platform = options.platform ?? process.platform;
   const spawnOptions: SpawnOptions = {
     cwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   };
-  const child = (deps.spawn ?? nodeSpawn)(command, args, spawnOptions);
+  const launched = spawnPlatformCommand(command, args, spawnOptions, platform, env, undefined, deps.spawn ?? nodeSpawn);
+  const child = launched.child;
   const startedAt = now.toISOString();
-  writeLog(logStream, `[${startedAt}] $ ${command} ${args.join(' ')}\n`);
+  writeLog(logStream, `[${startedAt}] $ ${launched.spec.command} ${launched.spec.args.join(' ')}\n`);
 
   child.stdout?.on('data', (chunk: Buffer | string) => writeLog(logStream, String(chunk)));
   child.stderr?.on('data', (chunk: Buffer | string) => writeLog(logStream, String(chunk)));
@@ -266,8 +278,8 @@ export function launchDirectSession(
     schema_version: DIRECT_SESSION_SCHEMA_VERSION,
     session_id: sessionId,
     cwd,
-    command,
-    args,
+    command: launched.spec.command,
+    args: launched.spec.args,
     pid: child.pid,
     log_path: logPath,
     started_at: startedAt,
@@ -276,18 +288,22 @@ export function launchDirectSession(
   };
 }
 
-export function runOmxCatalogCommand(options: RunOmxCatalogCommandOptions): RunOmxCatalogCommandResult {
+export function runOmxCatalogCommand(
+  options: RunOmxCatalogCommandOptions,
+  deps: RunOmxCatalogCommandDeps = {},
+): RunOmxCatalogCommandResult {
   const cwd = normalizeCwd(options.cwd);
   const command = options.omxCommand?.trim() || DEFAULT_OMX_COMMAND;
-  const result = nodeSpawnSync(command, options.args, {
+  const env = { ...(options.env ?? process.env), [LAUNCH_POLICY_ENV]: 'direct', [VSCODE_RUNNER_ENV]: '1' };
+  const { spec, result } = spawnPlatformCommandSync(command, options.args, {
     cwd,
-    env: { ...(options.env ?? process.env), [LAUNCH_POLICY_ENV]: 'direct', [VSCODE_RUNNER_ENV]: '1' },
+    env,
     encoding: 'utf8',
     timeout: options.timeoutMs ?? 120_000,
-  });
+  }, options.platform ?? process.platform, env, undefined, deps.spawnSync ?? nodeSpawnSync);
   return {
-    command,
-    args: [...options.args],
+    command: spec.command,
+    args: [...spec.args],
     stdout: String(result.stdout ?? ''),
     stderr: result.error ? result.error.message : String(result.stderr ?? ''),
     code: typeof result.status === 'number' ? result.status : null,

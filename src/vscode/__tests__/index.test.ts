@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { ChildProcess, SpawnOptions } from 'node:child_process';
+import type { ChildProcess, SpawnOptions, SpawnSyncReturns } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -110,6 +110,48 @@ describe('VSCode direct session API', () => {
     });
   });
 
+  it('launches direct sessions through Windows command shims', async () => {
+    await withTempDir(async (cwd) => {
+      const fakeBin = join(cwd, 'bin');
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(fakeBin, 'omx.cmd'), '@echo off\r\n');
+
+      let capturedCommand = '';
+      let capturedArgs: string[] = [];
+      let capturedOptions: SpawnOptions | undefined;
+      const child = fakeChildProcess();
+      const spawn = (command: string, args: string[], options: SpawnOptions): ChildProcess => {
+        capturedCommand = command;
+        capturedArgs = [...args];
+        capturedOptions = options;
+        return child;
+      };
+
+      const handle = launchDirectSession({
+        cwd,
+        omxCommand: 'omx',
+        sessionId: 'vscode-windows-session',
+        env: {
+          PATH: fakeBin,
+          PATHEXT: '.CMD;.EXE',
+          ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+        },
+        platform: 'win32',
+      }, { spawn });
+
+      assert.equal(capturedCommand, 'C:\\Windows\\System32\\cmd.exe');
+      assert.deepEqual(capturedArgs.slice(0, 3), ['/d', '/s', '/c']);
+      assert.match(capturedArgs[3] ?? '', /omx\.cmd/i);
+      assert.match(capturedArgs[3] ?? '', /launch/);
+      assert.equal(capturedOptions?.windowsHide, true);
+      assert.equal(capturedOptions?.windowsVerbatimArguments, true);
+      assert.equal(handle.command, capturedCommand);
+
+      child.emit('exit', 0, null);
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+  });
+
   it('redacts child process output before writing VSCode session logs', async () => {
     await withTempDir(async (cwd) => {
       const child = fakeChildProcess();
@@ -184,6 +226,53 @@ describe('VSCode direct session API', () => {
       assert.equal(payload.policy, 'direct');
       assert.equal(payload.runner, '1');
       assert.deepEqual(payload.argv, ['doctor', '--json']);
+    });
+  });
+
+  it('runs catalog commands through Windows command shims', async () => {
+    await withTempDir(async (cwd) => {
+      const fakeBin = join(cwd, 'bin');
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(fakeBin, 'omx.cmd'), '@echo off\r\n');
+
+      let capturedCommand = '';
+      let capturedArgs: readonly string[] = [];
+      let capturedOptions: { env?: NodeJS.ProcessEnv; windowsHide?: boolean; windowsVerbatimArguments?: boolean } | undefined;
+      const spawnSync = ((command: string, args: readonly string[], options?: typeof capturedOptions) => {
+        capturedCommand = command;
+        capturedArgs = [...args];
+        capturedOptions = options;
+        return {
+          status: 0,
+          stdout: 'ok',
+          stderr: '',
+          pid: 1,
+          output: [],
+          signal: null,
+        } as SpawnSyncReturns<string>;
+      }) as unknown as typeof import('node:child_process').spawnSync;
+
+      const result = runOmxCatalogCommand({
+        cwd,
+        omxCommand: 'omx',
+        args: ['doctor'],
+        env: {
+          PATH: fakeBin,
+          PATHEXT: '.CMD;.EXE',
+          ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+        },
+        platform: 'win32',
+      }, { spawnSync });
+
+      assert.equal(result.code, 0);
+      assert.equal(result.command, 'C:\\Windows\\System32\\cmd.exe');
+      assert.equal(capturedCommand, 'C:\\Windows\\System32\\cmd.exe');
+      assert.deepEqual(capturedArgs.slice(0, 3), ['/d', '/s', '/c']);
+      assert.match(capturedArgs[3] ?? '', /omx\.cmd/i);
+      assert.match(capturedArgs[3] ?? '', /doctor/);
+      assert.equal(capturedOptions?.env?.OMX_LAUNCH_POLICY, 'direct');
+      assert.equal(capturedOptions?.windowsHide, true);
+      assert.equal(capturedOptions?.windowsVerbatimArguments, true);
     });
   });
 
