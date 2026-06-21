@@ -356,6 +356,10 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	// Check 4.6: Lore commit guard default
 	checks.push(await checkLoreCommitGuard(paths.configPath));
 
+	// Check 4.7: External process guards
+	const externalProcessGuardCheck = await checkExternalCodexProcessGuards();
+	if (externalProcessGuardCheck) checks.push(externalProcessGuardCheck);
+
 	// Check 5: Prompts installed
 	checks.push(
 		await checkPrompts(paths.promptsDir, scopeResolution.installMode),
@@ -1427,6 +1431,140 @@ function isExplicitLoreCommitGuardOptOut(value: string): boolean {
 	return LORE_COMMIT_GUARD_EXPLICIT_OPT_OUT_VALUES.has(
 		value.trim().toLowerCase(),
 	);
+}
+
+interface ExternalCodexProcessGuardOptions {
+	platform?: NodeJS.Platform;
+	homeDir?: string;
+}
+
+function decodeBasicXmlEntities(value: string): string {
+	return value
+		.replaceAll("&amp;", "&")
+		.replaceAll("&lt;", "<")
+		.replaceAll("&gt;", ">")
+		.replaceAll("&quot;", '"')
+		.replaceAll("&apos;", "'");
+}
+
+function extractPlistStrings(content: string): string[] {
+	return [...content.matchAll(/<string>([^<]+)<\/string>/g)].map((match) =>
+		decodeBasicXmlEntities(match[1]?.trim() ?? ""),
+	);
+}
+
+function extractPlistLabel(content: string, fallback: string): string {
+	const labelMatch = content.match(
+		/<key>Label<\/key>\s*<string>([^<]+)<\/string>/,
+	);
+	return decodeBasicXmlEntities(labelMatch?.[1]?.trim() || fallback);
+}
+
+async function readExistingTextFile(path: string): Promise<string> {
+	try {
+		return await readFile(path, "utf-8");
+	} catch {
+		return "";
+	}
+}
+
+function expandLaunchAgentPath(value: string, homeDir: string): string {
+	if (value === "~") return homeDir;
+	if (value.startsWith("~/")) return join(homeDir, value.slice(2));
+	if (value === "$HOME") return homeDir;
+	if (value.startsWith("$HOME/")) return join(homeDir, value.slice(6));
+	if (value === "${HOME}") return homeDir;
+	if (value.startsWith("${HOME}/")) return join(homeDir, value.slice(8));
+	return value;
+}
+
+function classifyExternalCodexProcessGuard(
+	plistContent: string,
+	combinedContent: string,
+): string | null {
+	const lowerPlist = plistContent.toLowerCase();
+	const lower = combinedContent.toLowerCase();
+	if (
+		lower.includes("codex-mcp-child-guard") ||
+		lower.includes("codex_mcp_child_guard") ||
+		combinedContent.includes("CODEX_MCP_GUARD_DEDUPE_APP_CHILDREN") ||
+		(lower.includes("codex app-server") &&
+			lower.includes("pgrep -p") &&
+			lower.includes("kill"))
+	) {
+		return "Codex app-server MCP child dedupe";
+	}
+	if (
+		(lowerPlist.includes("codex-xcode-mcp-guard") ||
+			lowerPlist.includes("codex_xcode_mcp_guard")) &&
+		lower.includes("xcodebuildmcp") &&
+		lower.includes("kill")
+	) {
+		return "XcodeBuildMCP cleanup";
+	}
+	return null;
+}
+
+export async function checkExternalCodexProcessGuards(
+	options: ExternalCodexProcessGuardOptions = {},
+): Promise<Check | null> {
+	const platform = options.platform ?? process.platform;
+	if (platform !== "darwin") return null;
+
+	const homeDir = options.homeDir ?? process.env.HOME;
+	if (!homeDir) return null;
+
+	const launchAgentsDir = join(homeDir, "Library", "LaunchAgents");
+	if (!existsSync(launchAgentsDir)) return null;
+
+	let entries: string[];
+	try {
+		entries = await readdir(launchAgentsDir);
+	} catch {
+		return null;
+	}
+
+	const findings: string[] = [];
+	for (const entry of entries) {
+		if (!entry.endsWith(".plist")) continue;
+		const plistPath = join(launchAgentsDir, entry);
+		const plistContent = await readExistingTextFile(plistPath);
+		if (plistContent.trim() === "") continue;
+
+		const loweredPlist = plistContent.toLowerCase();
+		if (
+			!loweredPlist.includes("codex") &&
+			!loweredPlist.includes("mcp") &&
+			!loweredPlist.includes("omx")
+		) {
+			continue;
+		}
+
+		let combinedContent = plistContent;
+		for (const value of extractPlistStrings(plistContent)) {
+			const expandedValue = expandLaunchAgentPath(value, homeDir);
+			if (!expandedValue.startsWith("/")) continue;
+			if (!existsSync(expandedValue)) continue;
+			combinedContent += `\n${await readExistingTextFile(expandedValue)}`;
+		}
+
+		const reason = classifyExternalCodexProcessGuard(
+			plistContent,
+			combinedContent,
+		);
+		if (!reason) continue;
+
+		const label = extractPlistLabel(plistContent, entry);
+		findings.push(`${label} (${reason})`);
+	}
+
+	if (findings.length === 0) return null;
+
+	return {
+		name: "External process guards",
+		status: "warn",
+		message: `external LaunchAgent(s) may terminate Codex/MCP helper processes outside OMX setup ownership: ${findings.join(", ")}; unload/remove them before attributing SIGTERM or transport resets to standard OMX MCP configuration`,
+	};
 }
 
 interface NativeHookCheckContext {
