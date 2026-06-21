@@ -93,6 +93,7 @@ import {
 	hasOmxAgentsContract,
 	hasOmxManagedAgentsSections,
 	isOmxGeneratedAgentsMd,
+	preserveUserOmxPolicyBlocks,
 	upsertManagedAgentsBlock,
 } from "../utils/agents-md.js";
 import { DEFAULT_HUD_CONFIG, type HudPreset } from "../hud/types.js";
@@ -2570,6 +2571,9 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		} else if (pluginCacheMaterialize.status === "unchanged") {
 			console.log("  Local Codex plugin cache already exposes packaged OMX skills.");
 		}
+		if (pluginCacheMaterialize.status === "materialized" || pluginCacheMaterialize.status === "unchanged") {
+			console.log("  Start a new Codex session if /skills still shows stale OMX plugin skill metadata; the current session may keep its in-memory plugin registry until restart.");
+		}
 		if (shouldSyncSharedMcpRegistry) {
 			resolvedConfig = await syncSharedMcpRegistryIntoConfig(
 				scopeDirs.codexConfigFile,
@@ -2801,8 +2805,14 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 					}
 				}
 			} else if (usePluginAgentsMdDefault) {
+				const existingPluginAgentsMd = pluginAgentsMdExists
+					? await readFile(pluginAgentsMdDst, "utf-8")
+					: "";
+				const pluginAgentsMdContent = pluginAgentsMdExists
+					? preserveUserOmxPolicyBlocks(existingPluginAgentsMd, rewritten)
+					: rewritten;
 				const defaultWouldChange = pluginAgentsMdExists
-					? (await readFile(pluginAgentsMdDst, "utf-8")) !== rewritten
+					? existingPluginAgentsMd !== pluginAgentsMdContent
 					: true;
 				if (
 					resolvedScope.scope === "project" &&
@@ -2821,7 +2831,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 					console.log("  Stop the active session first, then re-run setup.");
 				} else {
 					const result = await syncManagedAgentsContent(
-						rewritten,
+						pluginAgentsMdContent,
 						pluginAgentsMdDst,
 						summary.agentsMd,
 						backupContext,

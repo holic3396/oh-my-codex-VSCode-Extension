@@ -395,6 +395,10 @@ type CliCommand =
   | "hud"
   | "sidecar"
   | "state"
+  | "notepad"
+  | "project-memory"
+  | "trace"
+  | "code-intel"
   | "wiki"
   | "mcp-serve"
   | "status"
@@ -423,6 +427,10 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "hud",
   "sidecar",
   "state",
+  "notepad",
+  "project-memory",
+  "trace",
+  "code-intel",
   "wiki",
   "mcp-serve",
   "ralph",
@@ -2543,7 +2551,7 @@ export async function main(args: string[]): Promise<void> {
         await showStatus();
         break;
       case "cancel":
-        await cancelModes();
+        await cancelModes(args.slice(1));
         break;
       case "reasoning":
         await reasoningCommand(args.slice(1));
@@ -2577,6 +2585,33 @@ export async function main(args: string[]): Promise<void> {
   }
 }
 
+type StaleCurrentAutopilotStatus = {
+  phase: string;
+};
+
+function sanitizedStatusString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+async function readStaleCurrentAutopilotStatus(cwd: string): Promise<StaleCurrentAutopilotStatus | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(join(getBaseStateDir(cwd), "current-autopilot.json"), "utf-8"));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const state = parsed as Record<string, unknown>;
+  if (state.active !== true) return null;
+  const phase = sanitizedStatusString(state.current_phase) ?? sanitizedStatusString(state.currentPhase);
+  const sessionId = sanitizedStatusString(state.session_id) ?? sanitizedStatusString(state.sessionId);
+  const tmuxPaneId = sanitizedStatusString(state.tmux_pane_id) ?? sanitizedStatusString(state.tmuxPaneId);
+  if (!phase && !sessionId && !tmuxPaneId) return null;
+  return { phase: phase ?? "active" };
+}
+
 async function showStatus(): Promise<void> {
   const { readFile } = await import("fs/promises");
   const cwd = process.cwd();
@@ -2598,15 +2633,24 @@ async function showStatus(): Promise<void> {
       }
       return false;
     };
-    if (!(await hasActiveWorkflowMode(refs))) {
+    let hasAuthoritativeActiveMode = await hasActiveWorkflowMode(refs);
+    if (!hasAuthoritativeActiveMode) {
       const runDirRefs = await listHookVisibleRunDirStateRefs(cwd);
-      if (await hasActiveWorkflowMode(runDirRefs)) refs = runDirRefs;
+      if (await hasActiveWorkflowMode(runDirRefs)) {
+        refs = runDirRefs;
+        hasAuthoritativeActiveMode = true;
+      }
     }
     const states = refs.map((ref) => ref.path);
     const ultragoalState = await readUltragoalState(cwd).catch(() => null);
     if (states.length === 0) {
       if (ultragoalState?.active) {
         console.log(`ultragoal: ACTIVE (phase: ${ultragoalState.status})`);
+        return;
+      }
+      const staleAutopilot = await readStaleCurrentAutopilotStatus(cwd);
+      if (staleAutopilot) {
+        console.log(`autopilot: STALE (phase: ${staleAutopilot.phase})`);
         return;
       }
       console.log("No active modes.");
@@ -2630,6 +2674,12 @@ async function showStatus(): Promise<void> {
     }
     if (ultragoalState?.active) {
       console.log(`ultragoal: ACTIVE (phase: ${ultragoalState.status})`);
+    }
+    if (!hasAuthoritativeActiveMode && !ultragoalState?.active) {
+      const staleAutopilot = await readStaleCurrentAutopilotStatus(cwd);
+      if (staleAutopilot) {
+        console.log(`autopilot: STALE (phase: ${staleAutopilot.phase})`);
+      }
     }
   } catch (err) {
     logCliOperationFailure(err);
@@ -6190,10 +6240,11 @@ async function listHookVisibleRunDirStateRefs(cwd: string): Promise<ModeStateFil
   return refs.sort((a, b) => a.mode.localeCompare(b.mode));
 }
 
-async function cancelModes(): Promise<void> {
+async function cancelModes(args: string[] = []): Promise<void> {
   const { writeFile, readFile } = await import("fs/promises");
   const cwd = process.cwd();
   const nowIso = new Date().toISOString();
+  const force = args.includes("--force");
   try {
     const loadStates = async (refs: ModeStateFileRef[]) => {
       const loaded = new Map<
@@ -6233,6 +6284,8 @@ async function cancelModes(): Promise<void> {
       if (hasActiveWorkflowMode(runDirStates)) states = runDirStates;
     }
 
+    const currentSession = await readSessionState(cwd).catch(() => null);
+    const currentSessionId = typeof currentSession?.session_id === "string" ? currentSession.session_id.trim() : "";
     const changed = new Set<string>();
     const reported = new Set<string>();
 
@@ -6289,6 +6342,19 @@ async function cancelModes(): Promise<void> {
     for (const [mode, entry] of states.entries()) {
       if (!changed.has(mode)) continue;
       await writeFile(entry.path, JSON.stringify(entry.state, null, 2));
+    }
+    if (force && currentSessionId) {
+      const stopStateEntries = [...states.entries()].filter(([mode]) => mode === "native-stop");
+      for (const [, entry] of stopStateEntries) {
+        const sessions = entry.state.sessions && typeof entry.state.sessions === "object" && !Array.isArray(entry.state.sessions)
+          ? { ...(entry.state.sessions as Record<string, unknown>) }
+          : null;
+        if (!sessions || !Object.prototype.hasOwnProperty.call(sessions, currentSessionId)) continue;
+        delete sessions[currentSessionId];
+        entry.state.sessions = sessions;
+        await writeFile(entry.path, JSON.stringify(entry.state, null, 2));
+        changed.add("native-stop");
+      }
     }
 
     for (const mode of reported) {
