@@ -6,11 +6,14 @@ import {
   createConversation,
   listConversations,
   readConversation,
+  updateMessage,
   type ChatConversation,
   type ChatConversationSummary,
 } from './chatStore';
 import { normalizeWebviewMessage } from './chatProtocol';
+import { formatSessionMessage, trimTranscript } from './sessionTranscript';
 import { getWorkspaceRoot, OmxSessionManager } from './sessionManager';
+import type { DirectSessionHandle } from './types';
 import { listVscodeLogs, realPathInsideWorkspace, type VscodeLogSummary } from './workspaceStatus';
 
 interface ChatViewState {
@@ -125,22 +128,73 @@ export class OmxChatPanel {
     const cwd = getWorkspaceRoot();
     const conversation = await this.ensureConversation(text);
     await appendMessage(cwd, conversation.id, { role: 'user', text });
-    await this.refresh();
 
-    try {
-      const handle = await this.sessionManager.start('launch', text);
+    if (this.sessionManager.active) {
       await appendMessage(cwd, conversation.id, {
         role: 'system',
-        text: handle
-          ? `Started OMX session ${handle.session_id}.\nLog: ${handle.log_path}`
-          : 'OMX launch was cancelled.',
+        text: 'An OMX session is already running. Stop it before sending another prompt.',
+      });
+      await this.refresh();
+      return;
+    }
+
+    const pending = await appendMessage(cwd, conversation.id, {
+      role: 'assistant',
+      text: 'Starting OMX session...',
+    });
+    const responseId = pending.messages[pending.messages.length - 1]?.id;
+    let transcript = '';
+    let handle: DirectSessionHandle | null = null;
+    let terminalStatus: string | null = null;
+    let updateQueue: Promise<void> = Promise.resolve();
+    const updateResponse = async (status: string): Promise<void> => {
+      if (!responseId) return;
+      await updateMessage(cwd, conversation.id, responseId, {
+        text: formatSessionMessage(status, handle, transcript),
         session_id: handle?.session_id,
         log_path: handle?.log_path,
       });
+      await this.refresh();
+    };
+    const scheduleResponseUpdate = (status: string): void => {
+      updateQueue = updateQueue
+        .catch(() => undefined)
+        .then(() => updateResponse(status));
+      void updateQueue.catch((error) => {
+        this.output.appendLine(`[omx] chat update failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    };
+    await this.refresh();
+
+    try {
+      handle = await this.sessionManager.start('launch', text, {
+        onOutput: (_stream, chunk) => {
+          transcript = trimTranscript(`${transcript}${chunk}`);
+          scheduleResponseUpdate('Running');
+        },
+        onExit: (code, signal) => {
+          terminalStatus = `Exited code=${code ?? 'null'} signal=${signal ?? 'null'}`;
+          scheduleResponseUpdate(terminalStatus);
+        },
+        onError: (error) => {
+          terminalStatus = `Launch error: ${error.message}`;
+          scheduleResponseUpdate(terminalStatus);
+        },
+      });
+      if (handle) {
+        if (!terminalStatus) scheduleResponseUpdate('Running');
+        await updateQueue;
+      } else if (responseId) {
+        await updateMessage(cwd, conversation.id, responseId, { text: 'Launch cancelled.' });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(`[omx] chat launch failed: ${message}`);
-      await appendMessage(cwd, conversation.id, { role: 'assistant', text: `Launch failed:\n${message}` });
+      if (responseId) {
+        await updateMessage(cwd, conversation.id, responseId, { text: `Launch failed:\n${message}` });
+      } else {
+        await appendMessage(cwd, conversation.id, { role: 'assistant', text: `Launch failed:\n${message}` });
+      }
     }
     await this.refresh();
   }

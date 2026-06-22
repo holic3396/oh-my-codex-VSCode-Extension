@@ -5,6 +5,12 @@ import type { DirectSessionHandle } from './types';
 
 type DirectMode = 'launch' | 'resume';
 
+export interface SessionCallbacks {
+  onOutput?: (stream: 'stdout' | 'stderr', text: string) => void;
+  onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
+  onError?: (error: Error) => void;
+}
+
 export class OmxSessionManager {
   private activeSession: DirectSessionHandle | null = null;
 
@@ -28,7 +34,11 @@ export class OmxSessionManager {
     await this.start(mode, normalizePrompt(prompt));
   }
 
-  async start(mode: DirectMode, prompt?: string): Promise<DirectSessionHandle | null> {
+  async start(
+    mode: DirectMode,
+    prompt?: string,
+    callbacks: SessionCallbacks = {},
+  ): Promise<DirectSessionHandle | null> {
     const cwd = getWorkspaceRoot();
     const core = await loadOmxCore(this.context);
     const config = vscode.workspace.getConfiguration('omx');
@@ -58,7 +68,7 @@ export class OmxSessionManager {
       dangerousApproved,
       env: launchEnv.env,
     });
-    this.bindSession(handle, mode);
+    this.bindSession(handle, mode, callbacks);
     return handle;
   }
 
@@ -83,25 +93,36 @@ export class OmxSessionManager {
     if (result.stderr) this.output.append(result.stderr);
   }
 
-  private bindSession(handle: DirectSessionHandle, mode: DirectMode): void {
+  private bindSession(handle: DirectSessionHandle, mode: DirectMode, callbacks: SessionCallbacks): void {
     this.activeSession = handle;
     this.output.show(true);
     this.output.appendLine(`[omx] started ${mode} session ${handle.session_id}`);
     this.output.appendLine(`[omx] log: ${handle.log_path}`);
 
-    handle.child.stdout?.on('data', (chunk) => this.output.append(String(chunk)));
-    handle.child.stderr?.on('data', (chunk) => this.output.append(String(chunk)));
+    handle.child.stdout?.on('data', (chunk: Buffer | string) => {
+      const text = String(chunk);
+      this.output.append(text);
+      callbacks.onOutput?.('stdout', text);
+    });
+    handle.child.stderr?.on('data', (chunk: Buffer | string) => {
+      const text = String(chunk);
+      this.output.append(text);
+      callbacks.onOutput?.('stderr', text);
+    });
     handle.child.on('exit', (code, signal) => {
       this.output.appendLine(
         `\n[omx] session ${handle.session_id} exited code=${code ?? 'null'} signal=${signal ?? 'null'}`,
       );
+      callbacks.onExit?.(code, signal);
       if (this.activeSession?.session_id === handle.session_id) {
         this.activeSession = null;
         this.onDidChange();
       }
     });
     handle.child.on('error', (error) => {
-      this.output.appendLine(`[omx] launch error: ${error instanceof Error ? error.message : String(error)}`);
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.output.appendLine(`[omx] launch error: ${normalized.message}`);
+      callbacks.onError?.(normalized);
       if (this.activeSession?.session_id === handle.session_id) {
         this.activeSession = null;
         this.onDidChange();
