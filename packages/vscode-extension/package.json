@@ -13,6 +13,14 @@
     "Other"
   ],
   "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:omx.chat",
+    "onCommand:omx.openChat",
+    "onCommand:omx.start",
+    "onCommand:omx.resume",
+    "onCommand:omx.stop",
+    "onCommand:omx.doctor"
+  ],
   "contributes": {
     "commands": [
       {
@@ -41,6 +49,43 @@
         "category": "OMX"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "omx",
+          "title": "OMX",
+          "icon": "resources/omx.svg"
+        }
+      ]
+    },
+    "views": {
+      "omx": [
+        {
+          "id": "omx.chat",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "omx.start",
+          "when": "view == omx.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omx.stop",
+          "when": "view == omx.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "omx.doctor",
+          "when": "view == omx.chat",
+          "group": "navigation@3"
+        }
+      ]
+    },
     "configuration": {
       "title": "Oh My Codex",
       "properties": {
@@ -74,6 +119,12 @@
           "type": "boolean",
           "default": true,
           "description": "Require confirmation before launching sessions with madmax/yolo/bypass approval flags."
+        },
+        "omx.refreshIntervalMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "description": "Minimum refresh interval for session and log state in milliseconds."
         }
       }
     }
