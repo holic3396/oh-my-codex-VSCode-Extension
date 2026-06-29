@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.18.16] - 2026-06-27
+
+Patch release for the post-`0.18.15` diagnostics and stale-state hardening train: local session friction reporting is available, stale HUD/Ralph continuation state is guarded, and doctor artifact ownership warnings are safer.
+
+### Changed
+
+- **Local session friction reporting is available** — `omx session friction` can surface local run/session friction signals so resume and debugging workflows have more actionable history.
+
+### Fixed
+
+- **Stale HUD and Ralph continuation state is guarded** — HUD review status and Ralph Stop continuation handling avoid carrying stale review/stop signals across later workflow phases.
+- **Doctor artifact ownership diagnostics are safer** — `omx doctor` detects root-owned repository artifacts more clearly without over-warning on normal local files.
+
+### PRs
+
+- #2975, #2973, #2972, #2970
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.16.md`.
+
+## [0.18.15] - 2026-06-25
+
+Patch release for the post-`0.18.14` goal/runtime reliability train: completed-goal cleanup, state-path handling, guided autoresearch intake, MCP parity coverage, and native-hook resilience were tightened before the `0.18.16` follow-up train.
+
+### Fixed
+
+- **Goal and hook cleanup is sturdier** — completed-goal cleanup and native-hook handling are hardened for follow-up workflow runs.
+- **State path and autoresearch coverage is broader** — MCP state-path tests and guided autoresearch intake checks protect the release train.
+
+### Verification
+
+- `v0.18.15` was published from commit `e9e3bcc7` and superseded by the `0.18.16` release train.
+
 ## [0.18.14] - 2026-06-20
 
 Patch release for the post-`0.18.13` reliability train: agent/model routing diagnostics are clearer, goal/planning workflows are safer, plugin and native-hook behavior is sturdier, HUD/Team/tmux edge cases are tightened, doctor catches root-owned repo artifacts, and resume search discovers madmax run histories.

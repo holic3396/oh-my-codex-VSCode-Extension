@@ -6,7 +6,7 @@
 import { execFileSync, spawn } from "child_process";
 import { basename, dirname, join, posix, resolve, win32 } from "path";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "fs";
-import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "fs/promises";
+import { copyFile, cp, lstat, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash } from "crypto";
 import {
@@ -45,6 +45,7 @@ import { apiCommand } from "./api.js";
 import { agentsInitCommand } from "./agents-init.js";
 import { agentsCommand } from "./agents.js";
 import { sessionCommand } from "./session-search.js";
+import { urlCommand } from "./url.js";
 import { autoresearchCommand } from "./autoresearch.js";
 import { autoresearchGoalCommand } from "./autoresearch-goal.js";
 import { mcpParityCommand } from "./mcp-parity.js";
@@ -163,8 +164,10 @@ import { buildHookEvent } from "../hooks/extensibility/events.js";
 import { dispatchHookEvent } from "../hooks/extensibility/dispatcher.js";
 import {
   collectInheritableTeamWorkerArgs as collectInheritableTeamWorkerArgsShared,
+  parseTeamWorkerLaunchArgs,
   resolveTeamWorkerLaunchArgs,
   resolveTeamLowComplexityDefaultModel,
+  TEAM_WORKER_INHERITED_MODEL_ENV,
 } from "../team/model-contract.js";
 import {
   parseWorktreeMode,
@@ -227,7 +230,8 @@ Usage:
   omx resume    Resume Codex sessions (supports --project and --codex-home <path>)
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
-  omx session   Search prior local session transcripts (--codex-home <path> escape hatch)
+  omx session   Search and summarize local session history (--codex-home <path> escape hatch)
+  omx url       Passive URL reader (read <url> --json)
   omx agents-init [path]
                 Bootstrap lightweight AGENTS.md files for a repo/subtree
   omx agents    Manage Codex native agent TOML files
@@ -388,6 +392,7 @@ type CliCommand =
   | "sparkshell"
   | "team"
   | "session"
+  | "url"
   | "resume"
   | "version"
   | "tmux-hook"
@@ -438,6 +443,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "performance-goal",
   "resume",
   "session",
+  "url",
   "api",
   "sparkshell",
   "team",
@@ -940,25 +946,40 @@ async function materializeProjectLaunchRuntimeHistoryEntries(
 async function mergeProjectLaunchRuntimeHistoryEntries(
   runtimeCodexHome: string,
   sourceCodexHome: string,
+  mergedHistorySourceRealpaths: Set<string>,
 ): Promise<void> {
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(sourceCodexHome, entryName);
     if (!existsSync(source)) continue;
+    const sourceRealpath = realpathSync(source);
+    if (mergedHistorySourceRealpaths.has(sourceRealpath)) continue;
     const destination = join(runtimeCodexHome, entryName);
-    const sourceStat = await lstat(source);
+    const sourceStat = await stat(source);
     if (sourceStat.isDirectory()) {
       await mkdir(destination, { recursive: true });
       await cp(source, destination, { recursive: true, force: true, dereference: true });
+      mergedHistorySourceRealpaths.add(sourceRealpath);
       continue;
     }
+    if (entryName === "sessions") continue;
+    if (!sourceStat.isFile()) continue;
     if (existsSync(destination)) {
+      const destinationStat = await stat(destination);
+      if (!destinationStat.isFile()) {
+        await rm(destination, { recursive: true, force: true });
+        await copyFile(source, destination);
+        mergedHistorySourceRealpaths.add(sourceRealpath);
+        continue;
+      }
       const existing = await readFile(destination, "utf-8").catch(() => "");
       const addition = await readFile(source, "utf-8");
       const separator = existing === "" || existing.endsWith("\n") || addition === "" ? "" : "\n";
       await writeFile(destination, `${existing}${separator}${addition}`, "utf-8");
+      mergedHistorySourceRealpaths.add(sourceRealpath);
       continue;
     }
     await copyFile(source, destination);
+    mergedHistorySourceRealpaths.add(sourceRealpath);
   }
 }
 
@@ -1024,9 +1045,14 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
   }
   await ensureProjectLaunchRuntimeHistoryLinks(runtimeCodexHome, projectCodexHome);
   if (options.includeHistoryArtifacts === true && (options.extraHistoryCodexHomes?.length ?? 0) > 0) {
+    const mergedHistorySourceRealpaths = new Set<string>();
+    for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+      const source = join(projectCodexHome, entryName);
+      if (existsSync(source)) mergedHistorySourceRealpaths.add(realpathSync(source));
+    }
     await materializeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, projectCodexHome);
     for (const extraCodexHome of options.extraHistoryCodexHomes ?? []) {
-      await mergeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, extraCodexHome);
+      await mergeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, extraCodexHome, mergedHistorySourceRealpaths);
     }
   }
 
@@ -1975,15 +2001,53 @@ function applyDisposableWorktreeOmxRootForLaunch(
   env.OMX_ROOT = omxRootOverride;
 }
 
+function launchArgRequestsDisposableWorktree(arg: string): boolean {
+  return arg === "--worktree" ||
+    arg === "-w" ||
+    arg.startsWith("--worktree=") ||
+    // Covers both `-w=<name>` and `-w<name>`; an explicit `-w=` check would be a
+    // strict subset of this clause, so it is omitted as redundant.
+    (arg.startsWith("-w") && arg.length > 2);
+}
+
+function launchArgsRequestMadmaxIsolation(launchArgs: readonly string[]): boolean {
+  return launchArgs.some(
+    (arg) => arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG,
+  );
+}
+
+function launchArgsRequestDisposableWorktree(launchArgs: readonly string[]): boolean {
+  return launchArgs.some((arg) => launchArgRequestsDisposableWorktree(arg));
+}
+
+function clearInheritedMadmaxRootForDisposableWorktreeLaunch(
+  launchArgs: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!launchArgsRequestDisposableWorktree(launchArgs)) return;
+  if (env.OMXBOX_ACTIVE !== "1") return;
+  delete env.OMX_ROOT;
+  delete env.OMX_STATE_ROOT;
+  delete env.OMXBOX_ACTIVE;
+  delete env.OMX_SOURCE_CWD;
+  delete env[OMX_MADMAX_DETACHED_CONTEXT_ENV];
+}
+
 export function shouldAutoIsolateMadmaxLaunch(
   command: string,
   launchArgs: string[],
   env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
 ): boolean {
   if (command !== "launch" && command !== "exec") return false;
-  if (env.OMX_NO_BOX === "1" || env.OMXBOX_ACTIVE === "1") return false;
-  if (env.OMX_ROOT || env.OMX_STATE_ROOT) return false;
-  return launchArgs.some((arg) => arg === MADMAX_FLAG || arg === MADMAX_SPARK_FLAG);
+  if (env.OMX_NO_BOX === "1") return false;
+  if (!launchArgsRequestMadmaxIsolation(launchArgs)) return false;
+  const inheritedContext = env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+  if (env.OMXBOX_ACTIVE === "1" && inheritedContext && !resolveInheritedMadmaxRoot(env)) {
+    return false;
+  }
+  if (madmaxInheritedContextMatchesLaunch(cwd, launchArgs, env)) return false;
+  return true;
 }
 
 function sanitizeRunIdSegment(value: string): string {
@@ -2275,6 +2339,48 @@ export function withMadmaxDetachedContextLock<T>(
   );
 }
 
+function readMadmaxRunMetadata(
+  runRoot: string,
+): { cwd?: string; detached_launch_context?: string } | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(runRoot, ".omxbox-run.json"), "utf-8")) as {
+      cwd?: unknown;
+      detached_launch_context?: unknown;
+    };
+    return {
+      ...(typeof parsed.cwd === "string" ? { cwd: parsed.cwd } : {}),
+      ...(typeof parsed.detached_launch_context === "string"
+        ? { detached_launch_context: parsed.detached_launch_context }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveInheritedMadmaxRoot(env: NodeJS.ProcessEnv): string | undefined {
+  const root = env.OMX_ROOT?.trim() || env.OMX_STATE_ROOT?.trim();
+  return root || undefined;
+}
+
+function madmaxInheritedContextMatchesLaunch(
+  cwd: string,
+  launchArgs: readonly string[],
+  env: NodeJS.ProcessEnv,
+): boolean {
+  if (env.OMXBOX_ACTIVE !== "1") return false;
+  const context = env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+  if (!context) return false;
+  const inheritedRoot = resolveInheritedMadmaxRoot(env);
+  if (!inheritedRoot) return false;
+  const metadata = readMadmaxRunMetadata(inheritedRoot);
+  if (!metadata) return false;
+  if (metadata.cwd && metadata.cwd !== inheritedRoot) return false;
+  if (metadata.detached_launch_context !== context) return false;
+  const expectedContext = buildMadmaxDetachedLaunchContextKey(cwd, [...launchArgs], inheritedRoot);
+  return expectedContext === context;
+}
+
 function isMadmaxDetachedGuardEnabled(env: NodeJS.ProcessEnv): boolean {
   return env.OMXBOX_ACTIVE === "1" && typeof env[OMX_MADMAX_DETACHED_CONTEXT_ENV] === "string";
 }
@@ -2336,7 +2442,7 @@ function activateMadmaxIsolationIfNeeded(
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
 ): void {
-  if (!shouldAutoIsolateMadmaxLaunch(command, launchArgs, env)) return;
+  if (!shouldAutoIsolateMadmaxLaunch(command, launchArgs, env, cwd)) return;
   const runDir = createMadmaxIsolatedRoot(cwd, launchArgs, env);
   env.OMX_ROOT = runDir;
   env.OMXBOX_ACTIVE = "1";
@@ -2501,6 +2607,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "session":
         await sessionCommand(args.slice(1));
+        break;
+      case "url":
+        await urlCommand(args.slice(1));
         break;
       case "ralph":
         await ralphCommand(args.slice(1));
@@ -2762,6 +2871,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
       }
     }
   }
+  clearInheritedMadmaxRootForDisposableWorktreeLaunch(parsedWorktree.remainingArgs);
   applyDisposableWorktreeOmxRootForLaunch(ensuredLaunchWorktree);
 
   try {
@@ -2883,6 +2993,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
       }
     }
   }
+  clearInheritedMadmaxRootForDisposableWorktreeLaunch(parsedWorktree.remainingArgs);
   applyDisposableWorktreeOmxRootForLaunch(ensuredLaunchWorktree);
 
   const sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3009,6 +3120,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
     }
   }
 
+  clearInheritedMadmaxRootForDisposableWorktreeLaunch(parsedWorktree.remainingArgs);
   applyDisposableWorktreeOmxRootForLaunch(ensuredLaunchWorktree);
 
   const sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3960,6 +4072,7 @@ export function buildDetachedSessionBootstrapSteps(
   env: NodeJS.ProcessEnv = process.env,
   sqliteHomeOverride?: string,
   parentEnvFilePath?: string,
+  inheritedWorkerModel?: string | null,
 ): DetachedSessionTmuxStep[] {
   const detachedLeaderCmd = nativeWindows
     ? "powershell.exe"
@@ -4002,9 +4115,7 @@ export function buildDetachedSessionBootstrapSteps(
     sessionName,
     "-c",
     cwd,
-    ...(workerLaunchArgs
-      ? ["-e", `${TEAM_WORKER_LAUNCH_ARGS_ENV}=${workerLaunchArgs}`]
-      : []),
+    ...(workerLaunchArgs ? ["-e", `${TEAM_WORKER_LAUNCH_ARGS_ENV}=${workerLaunchArgs}`] : []),
     ...Object.entries(hudRuntimeEnv).map(([key, value]) => ["-e", `${key}=${value}`]).flat(),
     ...(codexHomeOverride ? ["-e", `CODEX_HOME=${codexHomeOverride}`] : []),
     ...(sqliteHomeOverride ? ["-e", `${CODEX_SQLITE_HOME_ENV}=${sqliteHomeOverride}`] : []),
@@ -4013,6 +4124,7 @@ export function buildDetachedSessionBootstrapSteps(
     ...(notifyTempContractRaw
       ? ["-e", `${OMX_NOTIFY_TEMP_CONTRACT_ENV}=${notifyTempContractRaw}`]
       : []),
+    ...(inheritedWorkerModel ? ["-e", `${TEAM_WORKER_INHERITED_MODEL_ENV}=${inheritedWorkerModel}`] : []),
     detachedLeaderCmd,
   ];
   const splitCaptureArgs: string[] = [
@@ -4807,6 +4919,10 @@ function runCodex(
     ? buildWindowsPromptCommand("node", [omxBin, "hud", "--watch"])
     : buildTmuxPaneCommand("env", [...hudEnvArgs, "node", omxBin, "hud", "--watch"]);
   const inheritLeaderFlags = process.env[TEAM_INHERIT_LEADER_FLAGS_ENV] !== "0";
+  const inheritedWorkerLaunchArgs = inheritLeaderFlags
+    ? collectInheritableTeamWorkerArgsShared(launchArgs)
+    : [];
+  const inheritedWorkerModel = parseTeamWorkerLaunchArgs(inheritedWorkerLaunchArgs).modelOverride ?? undefined;
   const workerLaunchArgs = resolveTeamWorkerLaunchArgsEnv(
     process.env[TEAM_WORKER_LAUNCH_ARGS_ENV],
     launchArgs,
@@ -4828,7 +4944,11 @@ function runCodex(
     ...buildHudRuntimeEnv({ sessionId }).env,
   };
   const codexEnv = workerLaunchArgs
-    ? { ...codexEnvWithSession, [TEAM_WORKER_LAUNCH_ARGS_ENV]: workerLaunchArgs }
+    ? {
+        ...codexEnvWithSession,
+        [TEAM_WORKER_LAUNCH_ARGS_ENV]: workerLaunchArgs,
+        ...(inheritedWorkerModel ? { [TEAM_WORKER_INHERITED_MODEL_ENV]: inheritedWorkerModel } : {}),
+      }
     : codexEnvWithSession;
   const codexEnvWithNotify = notifyTempContractRaw
     ? { ...codexEnv, [OMX_NOTIFY_TEMP_CONTRACT_ENV]: notifyTempContractRaw }
@@ -5072,6 +5192,7 @@ function runCodex(
           process.env,
           sqliteHomeOverride,
           detachedParentEnvFilePath,
+          inheritedWorkerModel,
         );
         for (const step of bootstrapSteps) {
           const output = execTmuxFileSync(step.args, {

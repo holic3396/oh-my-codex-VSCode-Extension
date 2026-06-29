@@ -1,6 +1,6 @@
 # oh-my-codex 0.18.16
 
-> Release status: published. Publication proof is recorded in `docs/qa/release-readiness-0.18.16.md`, including dev/main CI, tag workflow, GitHub release, native asset, and npm `latest` evidence.
+> Release note status: published. Validation and publication evidence is tracked in `docs/qa/release-readiness-0.18.16.md`.
 
 `0.18.16` is a patch release after `0.18.15` focused on local-session diagnostics, stale HUD/Ralph guard cleanup, and safer doctor artifact ownership warnings. It preserves the existing CLI/package contract while tightening developer-facing failure reporting and stale-state behavior from the current `origin/dev` delta.
 
@@ -29,9 +29,5 @@
 Release readiness evidence is recorded in `docs/qa/release-readiness-0.18.16.md`.
 
 Release-prep gates include version sync for `v0.18.16`, build, native-agent verification, plugin mirror/bundle checks, catalog docs check, targeted regression tests for doctor/session-search/HUD/native-hook/session friction, `npm pack --dry-run`, and `git diff --check`. Branch CI, dev/main promotion, tag-triggered release workflow, GitHub release proof, and npm publication proof are recorded in the readiness evidence.
-
-## Contributors
-
-Thanks to [@Yeachan-Heo](https://github.com/Yeachan-Heo) and [@iqdoctor](https://github.com/iqdoctor) for contributing to this release.
 
 **Full Changelog**: [`v0.18.15...v0.18.16`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.18.15...v0.18.16)

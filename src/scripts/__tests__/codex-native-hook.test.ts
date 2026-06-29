@@ -83,6 +83,22 @@ async function writeNativeMappedSessionState(
   });
 }
 
+async function writeLiveNativeMappedSessionState(
+  cwd: string,
+  stateDir: string,
+  sessionId: string,
+  nativeSessionId: string,
+): Promise<void> {
+  await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+  await writeJson(join(stateDir, "session.json"), {
+    session_id: sessionId,
+    native_session_id: nativeSessionId,
+    cwd,
+    pid: process.pid,
+    platform: "darwin",
+  });
+}
+
 async function writeSessionSkillActiveState(
   stateDir: string,
   sessionId: string,
@@ -776,6 +792,58 @@ describe("codex native hook dispatch", () => {
     }
   });
 
+  it("blocks deep-interview PreToolUse implementation writes when terminal Autopilot run-state shadows stale active state", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-deep-interview-terminal-pretool-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-deep-interview-terminal-pretool";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: sessionId });
+      await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "deep-interview",
+        phase: "planning",
+        session_id: sessionId,
+        active_skills: [{ skill: "deep-interview", phase: "planning", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "deep-interview-state.json"), {
+        active: true,
+        mode: "deep-interview",
+        current_phase: "intent-first",
+        session_id: sessionId,
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "run-state.json"), {
+        version: 1,
+        active: false,
+        mode: "autopilot",
+        outcome: "finish",
+        lifecycle_outcome: "finished",
+        current_phase: "complete",
+        completed_at: "2026-05-30T00:00:00.000Z",
+        updated_at: "2026-05-30T00:00:00.000Z",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: "thread-deep-interview-terminal-pretool",
+          tool_name: "Edit",
+          tool_input: { file_path: "src/runtime.ts" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /Deep-interview is active \(phase: intent-first\)/);
+      assert.match(JSON.stringify(result.outputJson), /implementation\/write tools are blocked/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("emits parseable no-op JSON stdout for inactive Stop CLI runs", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cli-stop-noop-json-"));
     try {
@@ -821,7 +889,7 @@ describe("codex native hook dispatch", () => {
     }
   });
 
-  it("returns empty JSON for oversized Stop stdin without parsing or creating inactive state", async () => {
+  it("emits no-op JSON for oversized Stop stdin without parsing or creating inactive state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cli-stop-oversized-"));
     try {
       const oversizedStop = JSON.stringify({
@@ -864,7 +932,7 @@ describe("codex native hook dispatch", () => {
     }
   });
 
-  it("does not block oversized Stop stdin for unrelated root autopilot state", async () => {
+  it("emits no-op JSON for oversized Stop stdin for unrelated root autopilot state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cli-stop-oversized-stale-root-"));
     try {
       await writeJson(join(cwd, ".omx", "state", "session.json"), {
@@ -888,7 +956,7 @@ describe("codex native hook dispatch", () => {
     }
   });
 
-  it("does not block oversized Stop stdin when terminal run-state shadows stale autopilot state", async () => {
+  it("emits no-op JSON for oversized Stop stdin when terminal run-state shadows stale autopilot state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cli-stop-oversized-terminal-run-"));
     try {
       const sessionId = "sess-cli-stop-oversized-terminal-run";
@@ -2544,6 +2612,230 @@ describe("codex native hook dispatch", () => {
     }
   });
 
+  it("allows same-session/current-thread Ralph Stop continuation", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-current-session-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await writeNativeMappedSessionState(cwd, stateDir, "omx-current-ralph", "codex-current-ralph");
+      await writeJson(join(stateDir, "sessions", "omx-current-ralph", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        owner_omx_session_id: "omx-current-ralph",
+        owner_codex_session_id: "codex-current-ralph",
+        owner_codex_thread_id: "thread-current-ralph",
+        task_description: "Finish issue 2974 stale Ralph Stop-hook guard",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "codex-current-ralph",
+          thread_id: "thread-current-ralph",
+          last_user_message: "continue the current ralph issue 2974 task",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "ralph_executing");
+      assert.match(String(result.outputJson?.systemMessage), /Ralph is still active/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not resume stale different-session global Ralph Stop state", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-stale-global-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        owner_codex_session_id: "codex-old-ralph",
+        owner_codex_thread_id: "thread-old-ralph",
+        task_description: "Finish issue 2974 stale Ralph Stop-hook guard",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          thread_id: "thread-new-ralph",
+          last_user_message: "continue the current ralph issue 2974 task",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.stopReason, undefined);
+      assert.notEqual(result.outputJson?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not resume global Ralph Stop state for low-overlap unrelated tasks", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-low-overlap-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        task_description: "Refactor documentation navigation and README examples",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          last_user_message: "continue auditing billing webhooks and payment retries",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.stopReason, undefined);
+      assert.notEqual(result.outputJson?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows explicit current user continuation for live-risk Ralph tasks when owner context is current", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-live-current-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        owner_codex_thread_id: "thread-live-ralph",
+        task_description: "Deploy billing migration rollback guard for production payments",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          thread_id: "thread-live-ralph",
+          last_user_message: "continue the current ralph deploy billing migration rollback guard",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "ralph_executing");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows current-owner global Ralph Stop continuation with generic current-task wording", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-current-owner-generic-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        owner_codex_thread_id: "thread-current-owner-generic",
+        task_description: "Refactor documentation navigation and README examples",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          thread_id: "thread-current-owner-generic",
+          last_user_message: "continue the current ralph task",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "ralph_executing");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows same-thread global Ralph Stop continuation without payload text for non-live tasks", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-same-thread-no-text-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        owner_codex_thread_id: "thread-same-thread-no-text",
+        task_description: "Refactor documentation navigation and README examples",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          thread_id: "thread-same-thread-no-text",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "ralph_executing");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks no-text global Ralph Stop continuation for live-risk tasks", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-live-no-text-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        owner_codex_thread_id: "thread-live-no-text",
+        task_description: "Deploy billing migration rollback guard for production payments",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          thread_id: "thread-live-no-text",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.stopReason, undefined);
+      assert.notEqual(result.outputJson?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks no-text global Ralph Stop continuation for issue 2974 operational live-risk tasks", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-stop-issue-2974-live-no-text-"));
+    try {
+      await writeJson(join(cwd, ".omx", "state", "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        task_description: "Implement Telegram assistant GPT switch plan on VPS service with cron restart send notify workflow",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.stopReason, undefined);
+      assert.notEqual(result.outputJson?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("resolves the Codex owner from ancestry without mistaking codex-native-hook wrappers for Codex", () => {
     const commands = new Map<number, string>([
       [2100, 'sh -c node "/repo/dist/scripts/codex-native-hook.js"'],
@@ -3345,7 +3637,7 @@ standardMaxRounds = 15
     }
   });
 
-  it("blocks explicit create_goal attempts even when adjacent text explains not to call it", async () => {
+  it("blocks explicit create_goal attempts when fresh native-goal cleanup evidence remains", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-completed-goal-mixed-stop-"));
     try {
       await writeJson(join(cwd, ".omx", "ultragoal", "goals.json"), {
@@ -3359,7 +3651,7 @@ standardMaxRounds = 15
         cwd,
         session_id: "sess-completed-goal-mixed-stop",
         thread_id: "thread-completed-goal-mixed-stop",
-        last_user_message: "Do not call create_goal until cleanup is explicit.",
+        last_user_message: "get_goal reports a completed Codex goal still attached to this thread; do not call create_goal until cleanup is explicit.",
         last_assistant_message: "I am starting another run now; create_goal payload follows.",
       }, { cwd });
 
@@ -3372,7 +3664,7 @@ standardMaxRounds = 15
     }
   });
 
-  it("blocks Stop when a final answer starts another goal over completed state", async () => {
+  it("does not block Stop when completed durable history alone precedes another goal", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-completed-goal-stop-"));
     try {
       await writeJson(join(cwd, ".omx", "ultragoal", "goals.json"), {
@@ -3386,15 +3678,13 @@ standardMaxRounds = 15
         cwd,
         session_id: "sess-completed-goal-stop",
         thread_id: "thread-completed-goal-stop",
-        last_assistant_message: "Starting another ultragoal now; create_goal payload follows.",
+        last_assistant_message: "Starting another ultragoal now; create_goal payload follows after /goal clear already cleared native state.",
       }, { cwd });
 
       const output = JSON.stringify(result.outputJson);
-      assert.equal(result.outputJson?.decision, "block");
-      assert.equal(result.outputJson?.stopReason, "completed_codex_goal_cleanup_required");
-      assert.match(output, /run \/goal clear/);
-      assert.match(output, /before calling create_goal/);
-      assert.match(output, /hooks only nudge and must not mutate Codex goal state/);
+      assert.notEqual(result.outputJson?.decision, "block");
+      assert.notEqual(result.outputJson?.stopReason, "completed_codex_goal_cleanup_required");
+      assert.doesNotMatch(output, /run \/goal clear/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6463,6 +6753,70 @@ exit 0
       );
       assert.equal(allowedAppendBash.outputJson, null);
 
+      const allowedPlanningStateWrite = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Write",
+          tool_use_id: "tool-di-planning-state-write",
+          tool_input: { file_path: ".omx/state/deep-interview-notes.json", content: "{}\n" },
+        },
+        { cwd },
+      );
+      assert.equal(allowedPlanningStateWrite.outputJson, null);
+
+      const protectedStateFiles = [
+        ".omx/state/sessions/sess-di-artifact/autopilot-state.json",
+        ".omx/state/sessions/sess-di-artifact/deep-interview-state.json",
+        ".omx/state/sessions/sess-di-artifact/skill-active-state.json",
+        ".omx/state/deep-interview-state.json",
+      ];
+      for (const [index, filePath] of protectedStateFiles.entries()) {
+        const protectedWrite = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Write",
+            tool_use_id: `tool-di-protected-state-${index}`,
+            tool_input: { file_path: filePath, content: "{}\n" },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (protectedWrite.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${filePath} should not be model-writable during deep-interview`,
+        );
+      }
+
+      const blockedStateCliMutation = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-write",
+          tool_input: { command: "omx state write --input '{\"mode\":\"deep-interview\",\"active\":false}' --json" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedStateCliMutation.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const allowedStateRead = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-read",
+          tool_input: { command: "omx state read --json" },
+        },
+        { cwd },
+      );
+      assert.equal(allowedStateRead.outputJson, null);
+
       const blockedBash = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -6760,6 +7114,21 @@ exit 0
       );
       assert.equal(allowedStateWrite.outputJson, null);
 
+      const blockedProtectedStatePatch = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-apply-patch",
+          tool_name: "apply_patch",
+          tool_use_id: "tool-di-apply-patch-protected-state",
+          tool_input: {
+            input: "*** Begin Patch\n*** Update File: .omx/state/sessions/sess-di-apply-patch/deep-interview-state.json\n@@\n-{}\n+{\"active\":false}\n*** End Patch\n",
+          },
+        },
+        { cwd },
+      );
+      assert.equal((blockedProtectedStatePatch.outputJson as { decision?: string } | null)?.decision, "block");
+
       const blockedOutsidePath = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -6867,6 +7236,31 @@ exit 0
         const writeResult = await preToolUse("Write", `tool-ralplan-write-${path}`, { file_path: path, content: "ok" });
         assert.equal(writeResult.outputJson, null, `Write should be allowed for ${path}`);
       }
+
+      for (const protectedPath of [
+        ".omx/state/sessions/sess-ralplan-guard/ralplan-state.json",
+        ".omx/state/sessions/sess-ralplan-guard/autopilot-state.json",
+        ".omx/state/sessions/sess-ralplan-guard/skill-active-state.json",
+      ]) {
+        const protectedResult = await preToolUse("Write", `tool-ralplan-protected-${protectedPath}`, {
+          file_path: protectedPath,
+          content: "{}",
+        });
+        assert.equal(
+          (protectedResult.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${protectedPath} should not be model-writable during ralplan`,
+        );
+      }
+
+      const blockedStateCliMutation = await preToolUse("Bash", "tool-ralplan-state-cli-write", {
+        command: "omx state clear --json",
+      });
+      assert.equal((blockedStateCliMutation.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(
+        String((blockedStateCliMutation.outputJson as { reason?: string } | null)?.reason ?? ""),
+        /omx state mutation is not model-writable/,
+      );
 
       const allowedPatchAdd = await preToolUse("apply_patch", "tool-ralplan-patch-add", {
         input: "*** Begin Patch\n*** Add File: .omx/plans/issue-2863.md\n+# Plan\n*** End Patch\n",
@@ -12235,6 +12629,64 @@ exit 0
     }
   });
 
+  it("does not block Stop after owner-session ralplan CLI completion writes to native canonical state", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ralplan-owner-alias-complete-"));
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const nativeSessionId = "native-id";
+      const ownerSessionId = "omx-owner-id";
+      await mkdir(join(stateDir, "sessions", nativeSessionId), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: nativeSessionId,
+        native_session_id: nativeSessionId,
+        owner_omx_session_id: ownerSessionId,
+        cwd,
+      });
+      await writeJson(join(stateDir, "sessions", nativeSessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "ralplan",
+        phase: "planning",
+        session_id: nativeSessionId,
+        active_skills: [{ skill: "ralplan", phase: "planning", active: true, session_id: nativeSessionId }],
+      });
+      await writeJson(join(stateDir, "sessions", nativeSessionId, "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "planning",
+        session_id: nativeSessionId,
+      });
+      process.env.OMX_SESSION_ID = ownerSessionId;
+
+      const writeResult = await executeStateOperation("state_write", {
+        mode: "ralplan",
+        active: false,
+        current_phase: "complete",
+        status: "complete",
+        terminal_state: "complete",
+        workingDirectory: cwd,
+      });
+
+      assert.notEqual(writeResult.isError, true);
+      assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json")), false);
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: nativeSessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not block on stale ralplan skill-active state when the matching mode state is absent", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-stale-skill-"));
     try {
@@ -16268,7 +16720,7 @@ exit 0
     }
   });
 
-  it("allows implementation writes when terminal Autopilot run-state shadows stale supervised ralplan state", async () => {
+  it("blocks implementation writes when terminal Autopilot run-state shadows stale supervised ralplan state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autopilot-ralplan-terminal-pretool-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -16312,7 +16764,9 @@ exit 0
       );
 
       assert.equal(result.omxEventName, "pre-tool-use");
-      assert.equal(result.outputJson, null);
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /(?:Ralplan|Autopilot planning) is active \(phase: ralplan\)/);
+      assert.match(JSON.stringify(result.outputJson), /implementation\/write tools are blocked/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -16673,7 +17127,7 @@ exit 0
     }
   });
 
-  it("allows mapped implementation writes when terminal Autopilot run-state shadows stale supervised ralplan state", async () => {
+  it("blocks mapped implementation writes when terminal Autopilot run-state shadows stale supervised ralplan state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autopilot-ralplan-native-map-terminal-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -16706,6 +17160,82 @@ exit 0
           thread_id: "thread-autopilot-ralplan-native-map-terminal",
           tool_name: "Edit",
           tool_input: { file_path: "src/runtime.ts" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /(?:Ralplan|Autopilot planning) is active \(phase: ralplan\)/);
+      assert.match(JSON.stringify(result.outputJson), /implementation\/write tools are blocked/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for implementation writes when a different live root session owns active ralplan state", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralplan-live-root-conflict-"));
+    const ownerCwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralplan-live-root-owner-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const ownerSessionId = "sess-ralplan-live-root-owner";
+      const ownerNativeSessionId = "019e-ralplan-live-root-owner";
+      await writeLiveNativeMappedSessionState(ownerCwd, stateDir, ownerSessionId, ownerNativeSessionId);
+      await writeSessionSkillActiveState(stateDir, ownerSessionId, "ralplan", "planning");
+      await writeJson(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "planning",
+        session_id: ownerSessionId,
+        cwd: ownerCwd,
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "019e-ralplan-live-root-unresolved-current",
+          thread_id: "thread-ralplan-live-root-conflict",
+          tool_name: "Edit",
+          tool_input: { file_path: "src/runtime.ts" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.reason ?? ""), /live root session pointer/i);
+      assert.match(String(result.outputJson?.reason ?? ""), /failing closed/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(ownerCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves authoritative owner planning artifact writes with a live root session pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralplan-live-root-owner-pass-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-ralplan-live-root-owner-pass";
+      const nativeSessionId = "019e-ralplan-live-root-owner-pass";
+      await writeLiveNativeMappedSessionState(cwd, stateDir, sessionId, nativeSessionId);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ralplan", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "planning",
+        session_id: sessionId,
+        cwd,
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: nativeSessionId,
+          thread_id: "thread-ralplan-live-root-owner-pass",
+          tool_name: "Bash",
+          tool_input: { command: "cat <<'EOF' > .omx/plans/live-root-owner.md\nplanning\nEOF" },
         },
         { cwd },
       );

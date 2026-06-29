@@ -24,6 +24,7 @@ import {
 import { resolveCanonicalTeamStateRoot, resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
 import {
   appendToLog,
+  isSessionStale,
   isSessionStateUsable,
   readSessionState,
   readUsableSessionState,
@@ -178,6 +179,37 @@ const SHORT_FOLLOWUP_PRIORITY_PATTERNS = [
   /(?:按照|按|基于)(?:这个|上述|当前)?(?:plan|计划|方案)/u,
   /\b(?:follow up|latest request|this turn|current turn|newest request)\b/i,
 ] as const;
+const RALPH_CONTINUATION_INTENT_PATTERNS = [
+  /\b(?:continue|resume|keep going|carry on|proceed|finish|complete)\b/i,
+  /\b(?:same|current|active|that|this)\s+(?:ralph|task|work|job|workflow)\b/i,
+  /\b(?:ralph)\b.{0,40}\b(?:continue|resume|finish|complete)\b/i,
+  /\b(?:continue|resume|finish|complete)\b.{0,40}\b(?:ralph)\b/i,
+] as const;
+const RALPH_LIVE_RISK_PATTERNS = [
+  /\b(?:prod|production|live|customer|user\s+data|billing|payment|credential|secret|token|key)\b/i,
+  /\b(?:deploy|release|publish|merge|push|delete|remove|drop|destroy|migrate|migration)\b/i,
+  /\b(?:database|db|terraform|kubectl|kubernetes|aws|gcp|azure|external|destructive)\b/i,
+  /\b(?:telegram|vps|service|restart|send|notify|notification|notifications|cron)\b/i,
+] as const;
+const RALPH_TASK_TEXT_FIELDS = [
+  "task_description",
+  "taskDescription",
+  "objective",
+  "task",
+  "prompt",
+  "initial_prompt",
+  "initialPrompt",
+  "user_prompt",
+  "userPrompt",
+  "last_user_message",
+  "lastUserMessage",
+  "task_slug",
+] as const;
+const RALPH_INTENT_STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it",
+  "of", "on", "or", "that", "the", "this", "to", "with", "you", "your", "task", "work",
+  "ralph", "continue", "resume", "finish", "complete", "fix", "issue",
+]);
 const MAX_SESSION_META_LINE_BYTES = 256 * 1024;
 
 function safeString(value: unknown): string {
@@ -795,6 +827,7 @@ interface RalphStopOwnershipContext {
   threadId: string;
   currentNativeSessionId: string;
   tmuxPaneId: string;
+  payload?: CodexHookPayload;
 }
 
 function isRalphStartingPhase(state: Record<string, unknown>): boolean {
@@ -849,6 +882,135 @@ async function isStaleOrphanedRalphStartingState(
 
 function hasValue(values: string[], value: string): boolean {
   return value !== "" && values.some((candidate) => candidate === value);
+}
+
+function hasPositiveRalphStopOwnerMatch(
+  state: Record<string, unknown>,
+  context: RalphStopOwnershipContext,
+): boolean {
+  const ownerOmxSessionId = safeString(state.owner_omx_session_id).trim();
+  if (ownerOmxSessionId && ownerOmxSessionId === context.sessionId) return true;
+
+  const stateSessionId = safeString(state.session_id).trim();
+  if (!ownerOmxSessionId && stateSessionId && stateSessionId === context.sessionId) return true;
+
+  const codexOwnerSessionId = safeString(state.owner_codex_session_id).trim();
+  if (codexOwnerSessionId) {
+    const stopCodexSessionIds = [
+      context.payloadSessionId,
+      context.currentNativeSessionId,
+      context.sessionId,
+    ].filter(Boolean);
+    if (hasValue(stopCodexSessionIds, codexOwnerSessionId)) return true;
+  }
+
+  const stateThreadId = safeString(state.owner_codex_thread_id ?? state.thread_id).trim();
+  if (stateThreadId && context.threadId && stateThreadId === context.threadId) return true;
+
+  const statePaneId = safeString(state.tmux_pane_id).trim();
+  return statePaneId !== "" && context.tmuxPaneId !== "" && statePaneId === context.tmuxPaneId;
+}
+
+function textMatchesAny(text: string, patterns: readonly RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function extractRalphTaskText(state: Record<string, unknown>): string {
+  const values: string[] = [];
+  for (const field of RALPH_TASK_TEXT_FIELDS) {
+    const value = safeString(state[field]).trim();
+    if (value) values.push(value);
+  }
+
+  const taskMetadata = state.task_metadata ?? state.taskMetadata;
+  if (taskMetadata && typeof taskMetadata === "object") {
+    const metadata = taskMetadata as Record<string, unknown>;
+    for (const field of RALPH_TASK_TEXT_FIELDS) {
+      const value = safeString(metadata[field]).trim();
+      if (value) values.push(value);
+    }
+  }
+
+  return values.join("\n");
+}
+
+function extractRalphStopUserText(payload?: CodexHookPayload): string {
+  if (!payload) return "";
+  return [
+    payload.prompt,
+    payload.user_prompt,
+    payload.userPrompt,
+    payload.input,
+    payload.last_user_message,
+    payload.lastUserMessage,
+  ].map(safeString).filter(Boolean).join("\n");
+}
+
+function tokenizeRalphIntentText(text: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const match of text.toLowerCase().matchAll(/[a-z0-9][a-z0-9_-]{2,}/g)) {
+    const token = match[0].replace(/^issue-/, "");
+    if (!token || RALPH_INTENT_STOPWORDS.has(token)) continue;
+    tokens.add(token);
+  }
+  return tokens;
+}
+
+function countTokenOverlap(left: Set<string>, right: Set<string>): number {
+  let overlap = 0;
+  for (const token of left) {
+    if (right.has(token)) overlap += 1;
+  }
+  return overlap;
+}
+
+function hasCurrentRalphTaskOverlap(state: Record<string, unknown>, userText: string): boolean {
+  const taskText = extractRalphTaskText(state);
+  const taskTokens = tokenizeRalphIntentText(taskText);
+  const userTokens = tokenizeRalphIntentText(userText);
+  if (taskTokens.size === 0) return false;
+  if (userTokens.size === 0) return false;
+
+  const overlap = countTokenOverlap(taskTokens, userTokens);
+  const smallerSide = Math.min(taskTokens.size, userTokens.size);
+  return overlap >= 2 || (smallerSide <= 2 && overlap >= 1);
+}
+
+function hasMeaningfulRalphTaskText(state: Record<string, unknown>): boolean {
+  return tokenizeRalphIntentText(extractRalphTaskText(state)).size > 0;
+}
+
+function isRalphLiveRiskContinuation(state: Record<string, unknown>, userText: string): boolean {
+  return textMatchesAny(`${extractRalphTaskText(state)}\n${userText}`, RALPH_LIVE_RISK_PATTERNS);
+}
+
+function shouldAllowGlobalRalphStopContinuation(
+  state: Record<string, unknown>,
+  context: RalphStopOwnershipContext,
+): boolean {
+  const userText = extractRalphStopUserText(context.payload);
+  const hasContinuationIntent = textMatchesAny(userText, RALPH_CONTINUATION_INTENT_PATTERNS);
+  const hasTaskOverlap = hasCurrentRalphTaskOverlap(state, userText);
+  const hasTaskText = hasMeaningfulRalphTaskText(state);
+  const hasUserTaskText = tokenizeRalphIntentText(userText).size > 0;
+  const hasPositiveOwnerMatch = hasPositiveRalphStopOwnerMatch(state, context);
+
+  if (!activeRalphStateMatchesStopOwner(state, context)) return false;
+  if (!userText.trim()) {
+    if (isRalphLiveRiskContinuation(state, userText)) return false;
+    return hasPositiveOwnerMatch || !hasRalphOwnerHint(state);
+  }
+  if (isRalphLiveRiskContinuation(state, userText)) {
+    return hasContinuationIntent && (hasPositiveOwnerMatch || hasTaskOverlap);
+  }
+  if (hasPositiveOwnerMatch && hasContinuationIntent) {
+    return true;
+  }
+  if (hasTaskText && hasUserTaskText) {
+    return hasTaskOverlap;
+  }
+
+  return hasContinuationIntent || hasTaskOverlap;
 }
 
 function activeRalphStateMatchesStopOwner(
@@ -1097,6 +1259,7 @@ async function readActiveRalphState(
     payloadSessionId?: string;
     threadId?: string;
     tmuxPaneId?: string;
+    payload?: CodexHookPayload;
   },
 ): Promise<ActiveRalphStopState | null> {
   const [rawSessionInfo, usableSessionInfo] = await Promise.all([
@@ -1183,7 +1346,18 @@ async function readActiveRalphState(
 
   const directPath = join(stateDir, "ralph-state.json");
   const direct = await readJsonIfExists(directPath);
-  if (direct?.active === true && shouldContinueRun(direct)) {
+  if (
+    direct?.active === true
+    && shouldContinueRun(direct)
+    && shouldAllowGlobalRalphStopContinuation(direct, {
+      sessionId: safeString(ownerContext?.payloadSessionId).trim(),
+      payloadSessionId: safeString(ownerContext?.payloadSessionId).trim(),
+      threadId: safeString(ownerContext?.threadId).trim(),
+      currentNativeSessionId,
+      tmuxPaneId: safeString(ownerContext?.tmuxPaneId).trim(),
+      payload: ownerContext?.payload,
+    })
+  ) {
     return { state: direct, path: directPath };
   }
 
@@ -2457,6 +2631,12 @@ function looksLikeCreateGoalAttempt(text: string): boolean {
 function looksLikeCompletedGoalCleanupAttempt(text: string): boolean {
   return looksLikeGoalCreationAttempt(text) || looksLikeCreateGoalAttempt(text);
 }
+function hasFreshNativeGoalCleanupEvidence(text: string): boolean {
+  return /\b(?:get_goal|Codex goal|native goal|active goal|thread goal)\b.{0,120}\b(?:reports?|returns?|shows?|status|state|still|attached|pending|cleanup|required|requires?)\b.{0,120}\b(?:complete|completed|attached|pending|cleanup|required|clear)\b/i.test(text)
+    || /\b(?:complete|completed|attached|pending|cleanup|required|clear)\b.{0,120}\b(?:get_goal|Codex goal|native goal|active goal|thread goal)\b/i.test(text)
+    || /\b(?:pending[-_ ]cleanup|native[-_ ]goal[-_ ]cleanup|completed[-_ ]codex[-_ ]goal[-_ ]cleanup)\b/i.test(text);
+}
+
 
 async function findCompletedGoalWorkflowCleanupNotice(cwd: string): Promise<string | null> {
   const ultragoal = await readJsonIfExists(join(cwd, ".omx", "ultragoal", "goals.json"));
@@ -2500,6 +2680,7 @@ async function buildCompletedGoalCleanupStopOutput(payload: CodexHookPayload, cw
     safeString(payload.last_assistant_message ?? payload.lastAssistantMessage),
   ].join("\n");
   if (!looksLikeCompletedGoalCleanupAttempt(text)) return null;
+  if (!hasFreshNativeGoalCleanupEvidence(text)) return null;
   const notice = await findCompletedGoalWorkflowCleanupNotice(cwd);
   if (!notice) return null;
   const systemMessage = `${notice} Do not continue into create_goal until cleanup is explicit; hooks only nudge and must not mutate Codex goal state.`;
@@ -2912,10 +3093,54 @@ async function resolveInternalSessionIdForPayload(
   if (!canonicalSessionId) return payloadSessionId;
 
   const nativeSessionId = safeString(currentSession?.native_session_id).trim();
+  const ownerOmxSessionId = safeString(currentSession?.owner_omx_session_id).trim();
   if (!payloadSessionId) return canonicalSessionId;
   if (payloadSessionId === canonicalSessionId) return canonicalSessionId;
   if (nativeSessionId && payloadSessionId === nativeSessionId) return canonicalSessionId;
+  if (ownerOmxSessionId && payloadSessionId === ownerOmxSessionId) return canonicalSessionId;
   return payloadSessionId;
+}
+
+async function readRootSessionStateFromStateDir(stateDir: string): Promise<SessionState | null> {
+  const sessionPath = join(stateDir, "session.json");
+  if (!existsSync(sessionPath)) return null;
+
+  try {
+    const content = await readFile(sessionPath, "utf-8");
+    return JSON.parse(content) as SessionState;
+  } catch {
+    return null;
+  }
+}
+
+function payloadMatchesSessionPointer(payloadSessionId: string, state: SessionState): boolean {
+  const canonicalSessionId = safeString(state.session_id).trim();
+  const nativeSessionId = safeString(state.native_session_id).trim();
+  const ownerOmxSessionId = safeString(state.owner_omx_session_id).trim();
+  if (!payloadSessionId) return true;
+  return payloadSessionId === canonicalSessionId
+    || (nativeSessionId !== "" && payloadSessionId === nativeSessionId)
+    || (ownerOmxSessionId !== "" && payloadSessionId === ownerOmxSessionId);
+}
+
+function isRootSessionPointerLive(state: SessionState): boolean {
+  const hasPidMetadata = Number.isInteger(state.pid) && state.pid > 0;
+  if (!hasPidMetadata) return false;
+  return !isSessionStale(state, {
+    ...(state.platform ? { platform: state.platform } : {}),
+  });
+}
+
+async function readLiveRootSessionPointerConflict(
+  stateDir: string,
+  payloadSessionId: string,
+): Promise<SessionState | null> {
+  if (!payloadSessionId) return null;
+  const rootState = await readRootSessionStateFromStateDir(stateDir);
+  if (!rootState) return null;
+  if (payloadMatchesSessionPointer(payloadSessionId, rootState)) return null;
+  if (!isRootSessionPointerLive(rootState)) return null;
+  return rootState;
 }
 
 async function readUsableSessionStateFromStateDir(
@@ -2960,6 +3185,13 @@ const RALPLAN_ALLOWED_WRITE_PREFIXES = [
   ".omx/state",
   ".beads",
 ] as const;
+
+const PROTECTED_PLANNING_STATE_FILE_NAMES = new Set([
+  "autopilot-state.json",
+  "deep-interview-state.json",
+  "ralplan-state.json",
+  "skill-active-state.json",
+]);
 
 const PLANNING_MODE_IMPLEMENTATION_TOOL_NAMES = new Set([
   "Write",
@@ -3024,21 +3256,33 @@ function hasExplicitExecutionHandoffSkill(
   ));
 }
 
+function normalizePlanningArtifactRelativePath(cwd: string, rawPath: string): string | null {
+  const trimmed = rawPath.trim().replace(/^['"]|['"]$/g, "");
+  if (!trimmed || trimmed.includes("\0")) return null;
+  try {
+    const absolute = resolve(cwd, trimmed);
+    const relativePath = relative(cwd, absolute).replace(/\\/g, "/");
+    if (!relativePath || relativePath.startsWith("..") || relativePath.startsWith("/")) return null;
+    return relativePath;
+  } catch {
+    return null;
+  }
+}
+
+function isProtectedPlanningStatePath(relativePath: string): boolean {
+  if (relativePath !== ".omx/state" && !relativePath.startsWith(".omx/state/")) return false;
+  const fileName = relativePath.split("/").pop() ?? "";
+  return PROTECTED_PLANNING_STATE_FILE_NAMES.has(fileName);
+}
+
 function isAllowedPlanningArtifactPath(
   cwd: string,
   rawPath: string,
   allowedPrefixes: readonly string[],
 ): boolean {
-  const trimmed = rawPath.trim().replace(/^['"]|['"]$/g, "");
-  if (!trimmed || trimmed.includes("\0")) return false;
-  let relativePath: string;
-  try {
-    const absolute = resolve(cwd, trimmed);
-    relativePath = relative(cwd, absolute).replace(/\\/g, "/");
-  } catch {
-    return false;
-  }
-  if (!relativePath || relativePath.startsWith("..") || relativePath.startsWith("/")) return false;
+  const relativePath = normalizePlanningArtifactRelativePath(cwd, rawPath);
+  if (!relativePath) return false;
+  if (isProtectedPlanningStatePath(relativePath)) return false;
   return allowedPrefixes.some((prefix) => (
     relativePath === prefix || relativePath.startsWith(`${prefix}/`)
   ));
@@ -3284,6 +3528,7 @@ function commandHasDeepInterviewWriteIntent(command: string): boolean {
     || /\btee\s+(?:-a\s+)?[^\s&|;]+/.test(command)
     || /\bsed\s+(?:[^\n;&|]*\s)?-i(?:\b|['"])/.test(command)
     || /\b(?:python3?|node|perl|ruby)\b[\s\S]{0,260}\b(?:writeFileSync|writeFile|write_text|open\([^)]*["']w|File\.write|Path\()/.test(command)
+    || /\bomx\s+state\s+(?:write|clear)\b/.test(command)
     || /\b(?:git\s+(?:checkout|switch|restore|reset|apply|am|merge|rebase)|npm\s+(?:install|i|ci)|pnpm\s+(?:install|i)|yarn\s+(?:install|add))\b/.test(command);
 }
 
@@ -3327,7 +3572,8 @@ function describeImplementationToolBlock(
 
 function isAllowedDeepInterviewBashWrite(cwd: string, command: string): boolean {
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
-  if (/\bomx\s+(?:state\s+(?:write|read|clear)|question)\b/.test(command)) return true;
+  if (/\bomx\s+(?:state\s+read|question)\b/.test(command)) return true;
+  if (/\bomx\s+state\s+(?:write|clear)\b/.test(command)) return false;
   const targets = extractDeepInterviewCommandWriteTargets(command);
   return targets.length > 0 && targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target));
 }
@@ -3361,9 +3607,6 @@ async function readActiveDeepInterviewStateForPreToolUse(
   const autopilotMode = safeString(autopilotState.mode).trim();
   if (autopilotMode && autopilotMode !== "autopilot") return null;
   if (!modeStateMatchesSkillStopContext(autopilotState, cwd, sessionId)) return null;
-  const terminalAutopilotRunState = await readCanonicalTerminalRunStateForStop(cwd, sessionId, "autopilot");
-  if (terminalAutopilotRunState) return null;
-
   const autopilotStatePhase = safeString(autopilotState.current_phase ?? autopilotState.currentPhase).trim().toLowerCase();
   const autopilotIsDeepInterview = normalizeAutopilotPhase(autopilotStatePhase) === "deep-interview";
   const hasDeepInterviewScopedAutopilotSkill = listActiveSkills(canonicalState).some((entry) => (
@@ -3409,8 +3652,6 @@ async function readActiveRalplanStateForPreToolUse(
   const autopilotMode = safeString(autopilotState.mode).trim();
   if (autopilotMode && autopilotMode !== "autopilot") return null;
   if (!modeStateMatchesSkillStopContext(autopilotState, cwd, sessionId)) return null;
-  const terminalAutopilotRunState = await readCanonicalTerminalRunStateForStop(cwd, sessionId, "autopilot");
-  if (terminalAutopilotRunState) return null;
   if (!canonicalState) return null;
   const hasActiveAutopilotSkill = listActiveSkills(canonicalState).some((entry) => (
     entry.skill === "autopilot"
@@ -3439,7 +3680,8 @@ function isAllowedRalplanBashWrite(cwd: string, command: string): boolean {
     return beadsCommand.allowed && (targets.length === 0 || hasAllowedTargets);
   }
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
-  if (/\bomx\s+(?:state\s+(?:write|read|clear)|question)\b/.test(command)) return true;
+  if (/\bomx\s+(?:state\s+read|question)\b/.test(command)) return true;
+  if (/\bomx\s+state\s+(?:write|clear)\b/.test(command)) return false;
   return hasAllowedTargets;
 }
 
@@ -3459,6 +3701,9 @@ function buildRalplanBashBlockedDetail(cwd: string, command: string): string {
   }
   if (beadsCommand.present) {
     return "Beads tracker command also performs an implementation write outside allowed planning metadata";
+  }
+  if (/\bomx\s+state\s+(?:write|clear)\b/.test(command)) {
+    return "omx state mutation is not model-writable during gated planning; write planning artifacts instead";
   }
   return "Bash write intent did not identify an allowed planning artifact path or metadata path";
 }
@@ -3557,6 +3802,98 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
         `Deep-interview is requirements/spec mode. Treat detailed user answers as interview/spec material, not implicit implementation authorization. You may write only deep-interview artifacts under \`.omx/context/\`, \`.omx/interviews/\`, \`.omx/specs/\`, or required \`.omx/state/\` files. To implement, first ask for or process an explicit transition such as \`$ralplan\`, \`$autopilot\`, ${formatExecutionHandoffList(cwd)}.`,
     },
   };
+}
+
+function blocksDeepInterviewImplementationWrite(payload: CodexHookPayload, cwd: string): boolean {
+  const toolName = safeString(payload.tool_name).trim();
+  if (toolName === "Bash") {
+    return !isAllowedDeepInterviewBashWrite(cwd, readPreToolUseCommand(payload));
+  }
+  if (!DEEP_INTERVIEW_IMPLEMENTATION_TOOL_NAMES.has(toolName)) return false;
+  const candidates = collectImplementationToolPathCandidates(
+    payload,
+    toolName,
+    readPreToolUsePathCandidates(payload),
+  );
+  return candidates.length === 0
+    || !candidates.every((candidate) => isAllowedDeepInterviewArtifactPath(cwd, candidate));
+}
+
+// Shared builder for the "live root session pointer owned by another session"
+// fail-closed block. Deep-interview and ralplan/autopilot only differ in the
+// human-readable mode label and phase-description fragment; the decision,
+// structure, and guidance are identical.
+function buildRootPointerConflictBlock(
+  activeState: Record<string, unknown>,
+  planningModeLabel: string,
+  planningPhaseDescription: string,
+): Record<string, unknown> {
+  const phase = formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning");
+  return {
+    decision: "block",
+    reason: `${planningModeLabel} is active in the live root session pointer (phase: ${phase}), but the current native session could not be authoritatively resolved to that owner; failing closed for planning-write protection.`,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      additionalContext:
+        `OMX detected a live root session pointer owned by another session while a ${planningPhaseDescription} is active. `
+        + "This indicates collapsed session-root isolation. Do not perform implementation writes from this unresolved session; use the owning OMX session or restart with an isolated OMX_ROOT.",
+    },
+  };
+}
+
+function buildDeepInterviewRootPointerConflictBlock(activeState: Record<string, unknown>): Record<string, unknown> {
+  return buildRootPointerConflictBlock(activeState, "Deep-interview", "deep-interview planning phase");
+}
+
+function buildRalplanRootPointerConflictBlock(activeState: Record<string, unknown>): Record<string, unknown> {
+  const activeMode = safeString(activeState.mode).trim().toLowerCase();
+  const planningModeLabel = activeMode === "autopilot" ? "Autopilot planning" : "Ralplan";
+  return buildRootPointerConflictBlock(activeState, planningModeLabel, "ralplan/autopilot planning phase");
+}
+
+async function buildPlanningRootPointerConflictPreToolUseOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+  stateDir: string,
+  rootState: SessionState | null,
+): Promise<Record<string, unknown> | null> {
+  const rootSessionId = safeString(rootState?.session_id).trim();
+  if (!rootSessionId) return null;
+  const ownerCwd = safeString(rootState?.cwd).trim() || cwd;
+
+  const deepInterviewState = await readActiveDeepInterviewStateForPreToolUse(
+    ownerCwd,
+    stateDir,
+    rootSessionId,
+    "",
+  );
+  if (deepInterviewState && blocksDeepInterviewImplementationWrite(payload, cwd)) {
+    return buildDeepInterviewRootPointerConflictBlock(deepInterviewState);
+  }
+
+  const ralplanState = await readActiveRalplanStateForPreToolUse(
+    ownerCwd,
+    stateDir,
+    rootSessionId,
+    "",
+  );
+  if (!ralplanState) return null;
+
+  const toolName = safeString(payload.tool_name).trim();
+  let blocked = false;
+  if (toolName === "Bash") {
+    blocked = !isAllowedRalplanBashWrite(cwd, readPreToolUseCommand(payload));
+  } else if (PLANNING_MODE_IMPLEMENTATION_TOOL_NAMES.has(toolName)) {
+    const toolPathCandidates = collectImplementationToolPathCandidates(
+      payload,
+      toolName,
+      readPreToolUsePathCandidates(payload),
+    );
+    blocked = toolPathCandidates.length === 0
+      || toolPathCandidates.some((candidate) => !isAllowedRalplanArtifactPath(cwd, candidate));
+  }
+
+  return blocked ? buildRalplanRootPointerConflictBlock(ralplanState) : null;
 }
 
 function matchesSkillStopContext(
@@ -4538,6 +4875,7 @@ async function buildStopHookOutput(
     payloadSessionId: sessionId,
     threadId,
     tmuxPaneId: safeString(process.env.TMUX_PANE).trim(),
+    payload,
   };
   const ralphCompletionAuditBlock = options.skipRalphStopBlock === true
     ? null
@@ -5151,11 +5489,13 @@ export async function dispatchCodexNativeHook(
     }
   } else if (hookEventName === "PreToolUse") {
     const payloadSessionId = readPayloadSessionId(payload);
+    const rootPointerConflict = await readLiveRootSessionPointerConflict(stateDir, payloadSessionId);
     const preToolUseSessionId = payloadSessionId
       ? await resolveInternalSessionIdForPayload(cwd, payloadSessionId, stateDir)
       : "";
     outputJson = await buildDeepInterviewPreToolUseBoundaryOutput(payload, cwd, stateDir, preToolUseSessionId)
       ?? await buildRalplanPreToolUseBoundaryOutput(payload, cwd, stateDir, preToolUseSessionId)
+      ?? await buildPlanningRootPointerConflictPreToolUseOutput(payload, cwd, stateDir, rootPointerConflict)
       ?? await buildNativeSubagentCapacityCloseGuardOutput(payload, cwd, stateDir)
       ?? buildNativePreToolUseOutput(payload);
   } else if (hookEventName === "PostToolUse") {
@@ -5322,6 +5662,10 @@ async function buildOversizedStopActiveWorkflowOutput(cwd: string): Promise<Reco
   };
 }
 
+function buildOversizedStopInactiveWorkflowOutput(): Record<string, unknown> {
+  return {};
+}
+
 async function buildOversizedStdinHookOutput(
   rawHookEventName: CodexHookEventName | null,
   cwd: string,
@@ -5332,7 +5676,7 @@ async function buildOversizedStdinHookOutput(
     return { systemMessage };
   }
   if (rawHookEventName === "Stop") {
-    return await buildOversizedStopActiveWorkflowOutput(cwd) ?? {};
+    return await buildOversizedStopActiveWorkflowOutput(cwd) ?? buildOversizedStopInactiveWorkflowOutput();
   }
   return {
     continue: false,
